@@ -46,7 +46,7 @@ def _project_root() -> Path:
 
 def _tray_icon() -> QIcon:
     from .paths import bundled_data_dir
-    ico = bundled_data_dir() / "assets" / "tray.ico"
+    ico = bundled_data_dir() / "assets" / "app_icon.ico"
     if ico.exists():
         qi = QIcon(str(ico))
         if not qi.isNull():

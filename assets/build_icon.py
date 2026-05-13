@@ -1,10 +1,16 @@
-"""Render tray_source.svg → tray.ico (multi-size). Run once after install."""
+"""Render tray_source.svg → app_icon.ico (multi-size). Optional rebuild helper.
+
+NOTE: app_icon.ico in this directory was supplied directly (not regenerated
+from tray_source.svg) and the SVG no longer matches the binary icon shipped
+with the app. Running this script WILL overwrite app_icon.ico with the
+SVG-rendered version. Only run it if you intend to redesign via SVG.
+"""
 import sys
 from pathlib import Path
 
 ASSETS = Path(__file__).resolve().parent
 SVG = ASSETS / "tray_source.svg"
-ICO = ASSETS / "tray.ico"
+ICO = ASSETS / "app_icon.ico"
 TINT = "#E7EAF0"
 
 

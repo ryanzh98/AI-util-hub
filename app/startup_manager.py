@@ -13,7 +13,7 @@ def _main_script() -> Path:
 
 
 def _icon_path() -> Path:
-    return bundled_data_dir() / "assets" / "tray.ico"
+    return bundled_data_dir() / "assets" / "app_icon.ico"
 
 
 def _pythonw_executable() -> str:
