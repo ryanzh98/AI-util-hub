@@ -43,6 +43,11 @@ from . import tts_voice_catalog
 
 
 # Defaults match `respeaker_client._DEFAULT_*` and the `tts_with_rvc` library.
+# Playback slot encoding:
+#   ""         → system default output (audible on the user's speakers)
+#   "__none__" → don't route to this slot (no audio here)
+#   "<name>"   → substring of a Windows output device name (e.g. CABLE Input)
+NONE_SENTINEL = "__none__"
 DEFAULTS: dict[str, Any] = {
     "base_voice": tts_voice_catalog.DEFAULT_VOICE,
     "rvc_pitch": 0,
@@ -51,7 +56,8 @@ DEFAULTS: dict[str, Any] = {
     "rvc_filter_radius": 3,
     "rvc_protect": 0.33,
     "rvc_rms_mix_rate": 0.5,
-    "playback_device": "",  # empty = Windows default output
+    "playback_device_1": "",             # default: hear it on the speakers
+    "playback_device_2": NONE_SENTINEL,  # default: nothing on second slot
 }
 
 # fcpe was removed — on some GPU/driver combos it segfaults the CUDA context
@@ -109,13 +115,20 @@ TOOLTIPS: dict[str, str] = {
         "0.0 = follow the original TTS volume curve. 1.0 = use the model "
         "voice's volume curve. 0.5 splits the difference."
     ),
-    "playback_device": (
-        "Which Windows output device receives the generated audio.\n\n"
-        "Leave at (System default) to play through your speakers/"
-        "headphones. Pick a virtual cable (e.g. CABLE Input from VB-Audio "
-        "Cable) so OBS or any capture app can grab the audio as an "
-        "isolated source via the cable's recording side.\n\n"
+    "playback_device_1": (
+        "Primary playback target. Audio fans out to slot 1 AND slot 2 in "
+        "parallel — typical setup is slot 1 = (System default) so you "
+        "hear it on speakers, slot 2 = CABLE Input so OBS captures it.\n\n"
+        "Pick (None) to skip this slot entirely (e.g. you only want OBS "
+        "to hear it).\n\n"
         "Use the ↻ button to refresh after plugging in a new device."
+    ),
+    "playback_device_2": (
+        "Second playback target — sound plays to slot 1 AND slot 2 "
+        "simultaneously, so this is the 'mirror' slot for OBS capture, "
+        "secondary monitors, etc. Pick (None) to disable.\n\n"
+        "If you only need one output, leave this on (None) and just use "
+        "slot 1."
     ),
 }
 
@@ -179,7 +192,7 @@ class VoiceSettingsPanel(QWidget):
     expandedChanged = pyqtSignal(bool)
 
     COLLAPSED_HEIGHT = 30
-    EXPANDED_HEIGHT = 332
+    EXPANDED_HEIGHT = 372  # one extra row vs 332 for the second playback slot
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -333,29 +346,57 @@ class VoiceSettingsPanel(QWidget):
         self._rms_spin.valueChanged.connect(self._on_any_changed)
         form.addRow(_label_row("RMS mix rate", TOOLTIPS["rvc_rms_mix_rate"]), self._rms_spin)
 
-        # Playback device — combo + refresh button in a horizontal pair.
-        device_row = QWidget(host)
-        device_h = QHBoxLayout(device_row)
-        device_h.setContentsMargins(0, 0, 0, 0)
-        device_h.setSpacing(4)
-        self._device_combo = QComboBox(device_row)
-        self._device_combo.setStyleSheet(combo_qss)
-        self._device_combo.currentIndexChanged.connect(self._on_any_changed)
-        device_h.addWidget(self._device_combo, 1)
-        self._device_refresh_btn = QPushButton("↻", device_row)
-        self._device_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._device_refresh_btn.setFixedSize(24, 24)
-        self._device_refresh_btn.setToolTip("Re-scan output devices")
-        self._device_refresh_btn.setStyleSheet(
+        # Playback device — two slots so audio can fan out to e.g. speakers
+        # AND a virtual cable simultaneously. Slot 1 has the refresh button;
+        # slot 2 has an invisible spacer of the same size so the two combos
+        # right-align identically.
+        refresh_btn_qss = (
             f"QPushButton{{background:{COLOR.surface_3}; color:{COLOR.text_2};"
             f" border:1px solid {COLOR.line}; border-radius:6px; font-size:13px;}}"
             f"QPushButton:hover{{color:{COLOR.violet};"
             f" border-color:{COLOR.violet_line};}}"
         )
+
+        # Slot 1
+        device_row_1 = QWidget(host)
+        d1 = QHBoxLayout(device_row_1)
+        d1.setContentsMargins(0, 0, 0, 0)
+        d1.setSpacing(4)
+        self._device_combo_1 = QComboBox(device_row_1)
+        self._device_combo_1.setStyleSheet(combo_qss)
+        self._device_combo_1.currentIndexChanged.connect(self._on_any_changed)
+        d1.addWidget(self._device_combo_1, 1)
+        self._device_refresh_btn = QPushButton("↻", device_row_1)
+        self._device_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._device_refresh_btn.setFixedSize(24, 24)
+        self._device_refresh_btn.setToolTip("Re-scan output devices (refreshes both slots)")
+        self._device_refresh_btn.setStyleSheet(refresh_btn_qss)
         self._device_refresh_btn.clicked.connect(self._refresh_devices)
-        device_h.addWidget(self._device_refresh_btn)
-        self._refill_device_combo()
-        form.addRow(_label_row("Playback device", TOOLTIPS["playback_device"]), device_row)
+        d1.addWidget(self._device_refresh_btn)
+        form.addRow(
+            _label_row("Playback device 1", TOOLTIPS["playback_device_1"]),
+            device_row_1,
+        )
+
+        # Slot 2 — matching layout, but a transparent spacer where slot 1's
+        # refresh button lives, so the combos line up vertically.
+        device_row_2 = QWidget(host)
+        d2 = QHBoxLayout(device_row_2)
+        d2.setContentsMargins(0, 0, 0, 0)
+        d2.setSpacing(4)
+        self._device_combo_2 = QComboBox(device_row_2)
+        self._device_combo_2.setStyleSheet(combo_qss)
+        self._device_combo_2.currentIndexChanged.connect(self._on_any_changed)
+        d2.addWidget(self._device_combo_2, 1)
+        spacer = QWidget(device_row_2)
+        spacer.setFixedSize(24, 24)
+        d2.addWidget(spacer)
+        form.addRow(
+            _label_row("Playback device 2", TOOLTIPS["playback_device_2"]),
+            device_row_2,
+        )
+
+        self._refill_device_combos()
 
         # Reset row
         reset_row = QWidget(host)
@@ -419,24 +460,37 @@ class VoiceSettingsPanel(QWidget):
             self._protect_spin.setValue(float(s["rvc_protect"]))
             self._rms_spin.setValue(float(s["rvc_rms_mix_rate"]))
 
-            # Match the saved playback device by its stored substring, or fall
-            # back to (System default) when the device is no longer present.
-            # Try an exact match first (covers same-machine reloads); fall
-            # back to a substring match (covers minor driver-side renames so
-            # the user doesn't see "device reset to default" after a Windows
-            # audio-driver update).
-            wanted = str(s.get("playback_device") or "")
-            idx = self._device_combo.findData(wanted)
-            if idx < 0 and wanted:
-                needle = wanted.lower()
-                for i in range(self._device_combo.count()):
-                    data = self._device_combo.itemData(i)
-                    if isinstance(data, str) and data and needle in data.lower():
-                        idx = i
-                        break
-            if idx < 0:
-                idx = 0
-            self._device_combo.setCurrentIndex(idx)
+            # Match each saved playback slot by its stored sentinel/substring.
+            # Exact match first (covers same-machine reloads); substring
+            # fallback for minor driver-side renames so a Windows audio
+            # update doesn't reset the user's selection.
+            for combo, key, default_data in (
+                (self._device_combo_1, "playback_device_1", ""),
+                (self._device_combo_2, "playback_device_2", NONE_SENTINEL),
+            ):
+                raw = s.get(key)
+                wanted = "" if raw is None else str(raw)
+                idx = combo.findData(wanted)
+                if idx < 0:
+                    # Substring fallback only for real device names (not for
+                    # our sentinels — "" and "__none__" are exact matches).
+                    if wanted and wanted != NONE_SENTINEL:
+                        needle = wanted.lower()
+                        for i in range(combo.count()):
+                            data = combo.itemData(i)
+                            if (
+                                isinstance(data, str)
+                                and data
+                                and data not in (NONE_SENTINEL, "")
+                                and needle in data.lower()
+                            ):
+                                idx = i
+                                break
+                if idx < 0:
+                    idx = combo.findData(default_data)
+                if idx < 0:
+                    idx = 0
+                combo.setCurrentIndex(idx)
         finally:
             self._suppress = False
 
@@ -451,7 +505,8 @@ class VoiceSettingsPanel(QWidget):
         voice_id = self._voice_combo.currentData()
         if not voice_id:
             voice_id = DEFAULTS["base_voice"]
-        device = self._device_combo.currentData()
+        device_1 = self._device_combo_1.currentData()
+        device_2 = self._device_combo_2.currentData()
         return {
             "base_voice": voice_id,
             "rvc_pitch": int(self._pitch_spin.value()),
@@ -460,7 +515,8 @@ class VoiceSettingsPanel(QWidget):
             "rvc_filter_radius": int(self._filter_spin.value()),
             "rvc_protect": round(float(self._protect_spin.value()), 4),
             "rvc_rms_mix_rate": round(float(self._rms_spin.value()), 4),
-            "playback_device": device if isinstance(device, str) else "",
+            "playback_device_1": device_1 if isinstance(device_1, str) else "",
+            "playback_device_2": device_2 if isinstance(device_2, str) else NONE_SENTINEL,
         }
 
     def reset_to_defaults(self) -> None:
@@ -514,44 +570,56 @@ class VoiceSettingsPanel(QWidget):
         finally:
             self._voice_combo.blockSignals(False)
 
-    def _refill_device_combo(self) -> None:
-        """Populate the playback-device combo from sounddevice's output list.
+    def _refill_device_combos(self) -> None:
+        """Populate both playback-device combos from sounddevice's output list.
 
-        Stores the device *name* string as item data (not the integer index)
-        because indices are not stable across reboots / hotplug, but names
+        Item ordering matches both combos:
+            index 0 → (System default), data = ""
+            index 1 → (None),           data = NONE_SENTINEL
+            index 2..N → physical devices, data = device name string
+
+        We store the *name* string as item data (not the integer index)
+        because indices aren't stable across reboots / hotplug, but names
         are stable enough for our substring-match resolver.
         """
-        self._device_combo.blockSignals(True)
-        try:
-            self._device_combo.clear()
-            self._device_combo.addItem("(System default)", "")
+        for combo in (self._device_combo_1, self._device_combo_2):
+            combo.blockSignals(True)
             try:
-                import sounddevice as sd  # lazy — heavy import
-                for dev in sd.query_devices():
-                    try:
-                        if dev.get("max_output_channels", 0) <= 0:
+                combo.clear()
+                combo.addItem("(System default)", "")
+                combo.addItem("(None)", NONE_SENTINEL)
+                try:
+                    import sounddevice as sd  # lazy — heavy import
+                    for dev in sd.query_devices():
+                        try:
+                            if dev.get("max_output_channels", 0) <= 0:
+                                continue
+                            name = str(dev.get("name", "")).strip()
+                            if not name:
+                                continue
+                            combo.addItem(name, name)
+                        except (AttributeError, TypeError):
                             continue
-                        name = str(dev.get("name", "")).strip()
-                        if not name:
-                            continue
-                        self._device_combo.addItem(name, name)
-                    except (AttributeError, TypeError):
-                        continue
-            except Exception:
-                # No sounddevice / no audio backend — leave the combo with
-                # just the default entry; user will see that and know the
-                # picker is non-functional on this machine.
-                pass
-        finally:
-            self._device_combo.blockSignals(False)
+                except Exception:
+                    # No sounddevice / no audio backend — leave the combos
+                    # with just the sentinel entries. The picker still works;
+                    # the user just sees there are no physical devices.
+                    pass
+            finally:
+                combo.blockSignals(False)
 
     def _refresh_devices(self) -> None:
-        """Re-scan devices and try to preserve the current selection."""
-        current = self._device_combo.currentData()
+        """Re-scan devices and try to preserve both combos' current selection."""
+        current_1 = self._device_combo_1.currentData()
+        current_2 = self._device_combo_2.currentData()
         self._suppress = True
         try:
-            self._refill_device_combo()
-            idx = self._device_combo.findData(current if isinstance(current, str) else "")
-            self._device_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self._refill_device_combos()
+            for combo, current in (
+                (self._device_combo_1, current_1),
+                (self._device_combo_2, current_2),
+            ):
+                idx = combo.findData(current if isinstance(current, str) else "")
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
         finally:
             self._suppress = False

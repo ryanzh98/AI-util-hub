@@ -39,11 +39,17 @@ class Item:
     rvc_filter_radius: Optional[int] = None
     rvc_protect: Optional[float] = None
     rvc_rms_mix_rate: Optional[float] = None
-    # Substring of a Windows output device name (e.g. "CABLE Input") — when
-    # set, playback routes here instead of the system default so OBS / other
-    # capture apps can pick the audio up via the device's recording side.
-    # None or "" means "use system default" (today's behavior).
-    playback_device: Optional[str] = None
+    # Dual-output routing for the generated WAV. Each slot independently
+    # accepts a substring of a Windows output device name (e.g. "CABLE
+    # Input") OR one of two sentinels:
+    #   ""         → system default output (current Windows playback device)
+    #   "__none__" → skip this slot (no audio routed here)
+    # Typical setup for streaming: slot 1 = "" (hear it on speakers),
+    # slot 2 = "CABLE Input" (OBS captures the virtual cable). Both slots
+    # set to "__none__" means silent playback (unusual but allowed).
+    # Legacy `playback_device` key auto-migrates to slot 1 on load.
+    playback_device_1: Optional[str] = None
+    playback_device_2: Optional[str] = None
 
 
 @dataclass
@@ -138,6 +144,11 @@ def default_config() -> Config:
 
 def _item_from_dict(d: dict) -> Item:
     allowed = {f.name for f in fields(Item)}
+    # Migrate the legacy single-slot `playback_device` to slot 1.
+    # We don't write it back here — the next settingsChanged → save_config
+    # cycle naturally drops the old key (it's no longer in `allowed`).
+    if "playback_device" in d and "playback_device_1" not in d:
+        d = {**d, "playback_device_1": d.get("playback_device")}
     return Item(**{k: v for k, v in d.items() if k in allowed})
 
 

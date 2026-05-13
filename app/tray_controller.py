@@ -779,7 +779,8 @@ _VOICE_SETTING_FIELDS = (
     "rvc_filter_radius",
     "rvc_protect",
     "rvc_rms_mix_rate",
-    "playback_device",
+    "playback_device_1",
+    "playback_device_2",
 )
 
 

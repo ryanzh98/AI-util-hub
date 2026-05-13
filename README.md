@@ -82,13 +82,15 @@ All runtime config lives in `.env`. See `.env.example` for the full annotated li
 
 ### Routing TTS audio into OBS
 
-`Ctrl+Alt+5` and `Ctrl+Alt+6` play through the Windows default output, which OBS's *Application Audio Output Capture* often misses because `pythonw.exe` is a background process. For a reliable, isolated OBS track:
+`Ctrl+Alt+5` and `Ctrl+Alt+6` play through the Windows default output, which OBS's *Application Audio Output Capture* often misses because `pythonw.exe` is a background process. The recommended fix routes audio to a virtual cable that OBS captures as a regular input — and because the popup has two playback slots, you can hear it on your speakers AND have OBS grab the cable at the same time:
 
 1. Install **[VB-Audio Cable](https://vb-audio.com/Cable/)** (free, single installer).
-2. Open the Ctrl+Alt+5 or Ctrl+Alt+6 popup → **Advanced voice settings** → set **Playback device** to the `CABLE In…` entry (Windows truncates the name; the exact label varies by VB-Cable version, but pick whichever option contains `CABLE In` or `VB-Audio`). Setting is per-hotkey and persisted in `clipboard_actions.json`.
-3. In OBS, add an **Audio Input Capture** source → device = `CABLE Output (VB-Audio Virtual Cable)`. You now have a dedicated OBS track with its own volume + filters.
+2. Open the Ctrl+Alt+5 or Ctrl+Alt+6 popup → **Advanced voice settings**:
+   - **Playback device 1** → `(System default)` (so you hear it on your speakers/headphones).
+   - **Playback device 2** → the `CABLE In…` entry (Windows truncates the name; the exact label varies by VB-Cable version, but pick whichever option contains `CABLE In` or `VB-Audio`).
+3. In OBS, add an **Audio Input Capture** source → device = `CABLE Output (VB-Audio Virtual Cable)`. You now have a dedicated OBS track with its own volume + filters, while you still hear the audio locally.
 
-To still hear the audio locally while OBS captures it, enable *Audio Monitoring* on the OBS source (Audio Mixer → ⚙ → Advanced Audio Properties → Audio Monitoring = "Monitor and Output").
+Both slots are per-hotkey and persisted in `clipboard_actions.json`. Each slot can also be set to `(None)` if you want to skip it — e.g. slot 1 = `(None)` + slot 2 = `CABLE In…` to route audio *only* to OBS without local monitoring.
 
 ## Configuring shortcuts
 

@@ -403,6 +403,11 @@ def respeak(
     return str(Path(path).resolve())
 
 
+# Sentinel used in panel.DEFAULTS and Item.playback_device_N to mean
+# "skip this slot entirely" (vs "" which means system default).
+_NONE_SENTINEL = "__none__"
+
+
 def _resolve_output_device(name: str | None):
     """Substring-match `name` against sounddevice output devices.
 
@@ -437,16 +442,40 @@ def _resolve_output_device(name: str | None):
     return None
 
 
-def play_wav(wav_path: str, *, device: str | None = None) -> None:
-    """Play a WAV file. Blocks until done.
+def _slot_target(value: str | None):
+    """Map a slot value to playback intent.
 
-    When `device` is None/empty, plays through the Windows default output
-    (today's behavior). Otherwise resolves `device` to a sounddevice output
-    index by substring name match and routes audio there. Unknown device
-    names fall back to default with a stderr warning.
+    Returns:
+        ("skip", None)       — value is the None-sentinel; don't play here
+        ("device", idx_or_None) — play to that index (None == system default)
+    """
+    if value == _NONE_SENTINEL:
+        return ("skip", None)
+    return ("device", _resolve_output_device(value))
 
-    Raises RuntimeError on failure. Loads soundfile + sounddevice lazily so
-    the process can start without them when not in use.
+
+def play_wav(
+    wav_path: str,
+    *,
+    device_1: str | None = None,
+    device_2: str | None = None,
+) -> None:
+    """Play a WAV file, optionally fanning out to two devices in parallel.
+
+    Each slot accepts:
+        None / ""           → system default output
+        "__none__" sentinel → skip this slot (no audio routed here)
+        "<substring>"       → specific Windows output device by name match
+
+    If both slots resolve to the same device (typical: slot 1 = default,
+    slot 2 = (None)) we play once via `sd.play`. If they resolve to two
+    *different* devices we open two `sd.OutputStream`s in parallel threads
+    so the audio is audible on both at once — the standard trick for
+    "hear it on my speakers AND have OBS capture the cable simultaneously".
+    Sample-clock drift between the two streams is irrelevant at human
+    listening scale for non-realtime playback.
+
+    Blocks until all active streams finish. Raises RuntimeError on failure.
     """
     try:
         import soundfile as sf
@@ -459,15 +488,67 @@ def play_wav(wav_path: str, *, device: str | None = None) -> None:
     except Exception as e:
         raise RuntimeError(f"Failed to read WAV {wav_path}: {e}")
 
-    device_idx = _resolve_output_device(device)
-    try:
-        if device_idx is None:
-            sd.play(data, samplerate)
-        else:
-            sd.play(data, samplerate, device=device_idx)
-        sd.wait()
-    except Exception as e:
-        raise RuntimeError(f"Audio playback failed: {e}")
+    slot1 = _slot_target(device_1)
+    slot2 = _slot_target(device_2)
+
+    targets: list = []  # each entry is an int device index or None (= default)
+    for kind, idx in (slot1, slot2):
+        if kind != "skip" and idx not in targets:
+            targets.append(idx)
+
+    if not targets:
+        # Both slots skipped — caller asked for silent playback.
+        return
+
+    if len(targets) == 1:
+        # Single output — preserves the simple sd.play codepath.
+        t = targets[0]
+        try:
+            if t is None:
+                sd.play(data, samplerate)
+            else:
+                sd.play(data, samplerate, device=t)
+            sd.wait()
+        except Exception as e:
+            raise RuntimeError(f"Audio playback failed: {e}")
+        return
+
+    # Multi-output: one OutputStream per target on its own thread. We avoid
+    # sd.play() here because it uses module-level global state — parallel
+    # calls collide. Explicit streams have no shared state.
+    import threading
+
+    channels = data.shape[1] if data.ndim > 1 else 1
+    errors: list[str] = []
+    err_lock = threading.Lock()
+
+    def _play_to(dev_idx) -> None:
+        try:
+            stream_kwargs: dict = {
+                "samplerate": samplerate,
+                "channels": channels,
+                "dtype": "float32",
+            }
+            if dev_idx is not None:
+                stream_kwargs["device"] = dev_idx
+            with sd.OutputStream(**stream_kwargs) as stream:
+                stream.write(data)
+        except Exception as e:
+            label = "default" if dev_idx is None else f"device {dev_idx}"
+            with err_lock:
+                errors.append(f"{label}: {e}")
+
+    threads = [threading.Thread(target=_play_to, args=(t,), daemon=True)
+               for t in targets]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    if errors:
+        # Surface ALL errors so the user sees if e.g. only the OBS slot
+        # failed (their speakers might've worked fine).
+        raise RuntimeError("Audio playback failed: " + "; ".join(errors))
 
 
 class RespeakerWorker(QObject):
@@ -477,10 +558,12 @@ class RespeakerWorker(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        # Most-recent playback device name — used so replayWav routes to the
-        # same destination as the original synthesis without needing a new
-        # signal signature.
-        self._last_device: str | None = None
+        # Most-recent playback slot values — used so replayWav routes to the
+        # same destination(s) as the original synthesis without needing a new
+        # signal signature. None means "haven't played anything yet, use
+        # current settings".
+        self._last_device_1: str | None = None
+        self._last_device_2: str | None = None
 
     @pyqtSlot(str)
     def speak(self, text: str) -> None:
@@ -504,15 +587,19 @@ class RespeakerWorker(QObject):
     def replayWav(self, wav_path: str) -> None:
         """Re-play an already-generated WAV without re-synthesizing.
 
-        Routes to the same device as the most recent _run() (or system
-        default if nothing has played yet).
+        Routes to the same dual-output configuration as the most recent
+        _run() (or system default + skip if nothing has played yet).
         """
         if not wav_path or not Path(wav_path).exists():
             self.failed.emit(f"WAV not found: {wav_path}")
             return
         try:
             self.statusChanged.emit("Playing…")
-            play_wav(wav_path, device=self._last_device)
+            play_wav(
+                wav_path,
+                device_1=self._last_device_1,
+                device_2=self._last_device_2,
+            )
         except RuntimeError as e:
             self.failed.emit(str(e))
             return
@@ -530,11 +617,17 @@ class RespeakerWorker(QObject):
         except RuntimeError as e:
             self.failed.emit(str(e))
             return
-        device = (settings or {}).get("playback_device") or None
-        self._last_device = device
+        s = settings or {}
+        # Slot 1 default = "" (system default). Slot 2 default = sentinel
+        # (skip). If a key is missing from settings entirely, the matching
+        # default keeps today's single-output behavior intact.
+        device_1 = s.get("playback_device_1", "")
+        device_2 = s.get("playback_device_2", _NONE_SENTINEL)
+        self._last_device_1 = device_1
+        self._last_device_2 = device_2
         try:
             self.statusChanged.emit("Playing…")
-            play_wav(wav_path, device=device)
+            play_wav(wav_path, device_1=device_1, device_2=device_2)
         except RuntimeError as e:
             self.failed.emit(str(e))
             return

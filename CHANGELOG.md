@@ -15,7 +15,7 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 - `RESPEAKER_OUTPUT_DIR` env var — redirect generated WAVs to any directory (default: `audio_output/`).
 - TtsWindow (Ctrl+Alt+6): **Play again** button (Ctrl+P) replays the last generation without re-synthesis; **Open folder** button opens the output directory in Explorer.
 - `.ckpt` accepted alongside `.pth` for the RVC voice model (both in `models/respeaker/` and `Sound/<voice>/`).
-- Per-hotkey **Playback device** picker in *Advanced voice settings* — routes `Ctrl+Alt+5` / `Ctrl+Alt+6` audio to any Windows output device (e.g. VB-Audio CABLE Input) so OBS can capture it as an isolated source. Choice persists in `clipboard_actions.json` per hotkey.
+- **Dual-output playback** for `Ctrl+Alt+5` / `Ctrl+Alt+6` — *Advanced voice settings* now has **Playback device 1** and **Playback device 2**, so the generated audio can fan out to two outputs simultaneously (e.g. speakers + VB-Audio CABLE Input → OBS captures the cable while you still hear it). Either slot can be set to `(System default)`, `(None)`, or any Windows output device. Persists per-hotkey in `clipboard_actions.json`. Legacy single-slot `playback_device` is auto-migrated to slot 1.
 - **Save audio** button on Ctrl+Alt+6 (TTS) popup (Ctrl+S) — Save-As dialog copies the last generated WAV to a user-chosen path.
 - Ctrl+Alt+5 (recorder) keeps its window open in respeaker mode through a new **DONE** state with **Replay** + **Save audio** buttons — mic-recorded clones can now be replayed and exported without firing the hotkey again.
 
