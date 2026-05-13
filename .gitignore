@@ -35,6 +35,8 @@ app/last_failed.wav
 *.index
 *.onnx
 models/
+Sounds/
+Sounds/*
 
 # --- Vendored binaries (Windows EXEs we shouldn't ship) --------------
 bin/
