@@ -1,4 +1,4 @@
-# Voice Detection — one-shot installer + launcher.
+﻿# Voice Detection — one-shot installer + launcher.
 # Idempotent: re-running it skips already-done steps and just launches.
 
 $ErrorActionPreference = 'Continue'
@@ -394,6 +394,62 @@ if (-not (Test-Path $voicePth)) {
     }
 } else {
     Write-Ok "voice.pth already present."
+}
+
+# ------------------------------------------------------------------
+# 5c. CUDA / GPU health (we want offline features on the GPU)
+# ------------------------------------------------------------------
+Write-Step "[5c/6] Checking CUDA + GPU availability"
+$cudaProbe = (& $EnvPy -s -c "import torch; print('1' if torch.cuda.is_available() else '0')" 2>$null) -as [string]
+$cudaOk = ($cudaProbe -ne $null) -and ($cudaProbe.Trim() -eq '1')
+if ($cudaOk) {
+    $gpuName = (& $EnvPy -s -c "import torch; print(torch.cuda.get_device_name(0))" 2>$null) -as [string]
+    Write-Ok "CUDA available: $($gpuName.Trim())"
+} else {
+    # Is there NVIDIA hardware? Distinguishes 'no GPU' from 'driver missing'.
+    $hasNvidia = $false
+    try {
+        $hasNvidia = @(Get-PnpDevice -Class 'Display' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FriendlyName -match 'NVIDIA' }).Count -gt 0
+    } catch { }
+
+    if (-not $hasNvidia) {
+        Write-Warn "No NVIDIA GPU detected. Offline Whisper + voice cloning will run on CPU (slower)."
+    } else {
+        Write-Warn "NVIDIA GPU present but CUDA unavailable from PyTorch — likely missing/outdated driver."
+        Write-Warn "Download the latest driver: https://www.nvidia.com/Download/index.aspx"
+        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+        if ($winget) {
+            Write-Host "    Attempt to install NVIDIA driver via winget? [Y/n]: " -NoNewline -ForegroundColor Yellow
+            $reply = Read-Host
+            if ([string]::IsNullOrWhiteSpace($reply) -or $reply.Trim().ToUpper() -eq 'Y') {
+                Write-Warn "Running 'winget install Nvidia.GeForceExperience' — may require reboot afterwards."
+                & winget install -e --id Nvidia.GeForceExperience --accept-source-agreements --accept-package-agreements
+                Write-Warn "After GeForce Experience finishes downloading & installing the driver, REBOOT and re-run install_and_run.bat."
+            } else {
+                Write-Warn "Driver install skipped. Continuing with CPU."
+            }
+        } else {
+            Write-Warn "winget not found on this machine — install the driver manually from the URL above."
+        }
+        Write-Warn "Pre-warming with CPU for this run."
+    }
+}
+
+# ------------------------------------------------------------------
+# 5d. Pre-warm offline-feature model caches (idempotent — fast on re-runs)
+# ------------------------------------------------------------------
+Write-Step "[5d/6] Pre-warming offline models (faster-whisper, HuBERT, RMVPE)"
+$warmScript = Join-Path $ProjectRoot 'scripts\warm_up.py'
+if (Test-Path $warmScript) {
+    & $EnvPy -s $warmScript
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Pre-warm exited non-zero ($LASTEXITCODE). First hotkey fire may need to lazy-download."
+    } else {
+        Write-Ok "Pre-warm done."
+    }
+} else {
+    Write-Warn "scripts/warm_up.py missing; skipping pre-warm."
 }
 
 # ------------------------------------------------------------------

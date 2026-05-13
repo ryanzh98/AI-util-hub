@@ -9,10 +9,14 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 ### Added
 - AGPL-3.0 LICENSE.
 - `.github/ISSUE_TEMPLATE/bug_report.md`.
+- `scripts/warm_up.py` — pre-caches `faster-whisper`, HuBERT, and RMVPE so the first offline hotkey fire is instant.
+- `install_and_run.ps1` step `[5c]` — CUDA / GPU health check with optional `winget`-based NVIDIA driver install.
+- `install_and_run.ps1` step `[5d]` — invokes `scripts/warm_up.py`; skipped automatically when pretrains are already present.
 
 ### Changed
 - Comprehensive `.gitignore` covering secrets, model weights, runtime artifacts, and vendored binaries.
 - README License section spells out AGPL §13 implications for the HTTP API on port 8009.
+- README "What `install_and_run.bat` does" section reflects the new CUDA + pre-warm steps.
 
 ### Removed
 - `launch.bat` (redundant with `install_and_run.bat`).

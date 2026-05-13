@@ -34,9 +34,11 @@ Every shortcut is also exposed over HTTP on port 8009 so other machines (a VM wi
 4. Installs `requirements.txt` (PyQt6, faster-whisper, tts-with-rvc, fastapi, etc.).
 5. Downloads the default RVC voice model (~250 MB) to `models/respeaker/`.
 6. Copies `.env.example` → `.env` if missing.
-7. Launches the app in the system tray.
+7. **Detects CUDA state.** If an NVIDIA GPU is present but the driver is missing, offers to install it via `winget`. Falls back to CPU otherwise.
+8. **Pre-warms offline models** — caches `faster-whisper large-v3-turbo` (~1.5 GB), `hubert_base.pt` (~180 MB), and `rmvpe.pt` (~170 MB) so the first Ctrl+Alt+2 / Ctrl+Alt+5 / Ctrl+Alt+6 hotkey fire is instant. Skipped automatically on re-runs when already cached.
+9. Launches the app in the system tray.
 
-On subsequent runs it just launches (all checks skip).
+On subsequent runs, every check above is a fast no-op (~20 s end-to-end) — only step 9 does real work.
 
 ## Prerequisites
 
@@ -75,7 +77,7 @@ All runtime config lives in `.env`. See `.env.example` for the full annotated li
 4. Sources for RVC models: <https://weights.gg>, Hugging Face (`RVC` search), AI Hub Discord.
 5. **Naming gotcha when downloading raw training output**: the usable `.pth` is in the `weights/` folder. `D_*` / `G_*` files are training checkpoints — skip them. For the `.index`, pick the one starting with `added_`.
 
-The first time `Ctrl+Alt+5` fires, it lazy-loads the model (~10-30 s) and downloads HuBERT + RMVPE pretrains (~500 MB, one-time, cached in `~/.cache/huggingface/`). Subsequent fires are fast.
+`install_and_run.bat` pre-warms the engine on first install, so the first `Ctrl+Alt+5` fire is already instant. HuBERT + RMVPE pretrains (~370 MB) land at the project root; if they ever go missing, re-run the installer to fetch them again.
 
 ## Configuring shortcuts
 
