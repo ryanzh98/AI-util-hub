@@ -1,0 +1,49 @@
+# --- Secrets / config ------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+clipboard_actions.json
+
+# --- Python bytecode / build -----------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs (we use conda, but cover bases) ---------------------
+.venv/
+venv/
+env/
+
+# --- Runtime artifacts (auto-created at runtime) ---------------------
+audio_output/
+audio_temp/
+crash.log
+app/last_failed.wav
+
+# --- Large model weights (auto-downloaded by installer / runtime) ----
+*.pt
+*.pth
+*.index
+*.onnx
+models/
+
+# --- Vendored binaries (Windows EXEs we shouldn't ship) --------------
+bin/
+
+# --- IDE / OS --------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Claude Code workspace ------------------------------------------
+.claude/

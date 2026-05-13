@@ -1,0 +1,20 @@
+PyQt6>=6.7,<6.11
+sounddevice>=0.4.7
+numpy>=1.26
+soundfile>=0.12
+pynput>=1.7.7
+openai>=1.40
+python-dotenv>=1.0
+pywin32>=306
+winshell>=0.6
+Pillow>=10.4
+faster-whisper>=1.1
+ctranslate2>=4.4
+nvidia-cudnn-cu12>=9.0; sys_platform == "win32"
+nvidia-cublas-cu12>=12.4; sys_platform == "win32"
+yt-dlp>=2024.12.13
+pycaw>=20240210
+fastapi>=0.115
+uvicorn[standard]>=0.30
+tts-with-rvc
+imageio-ffmpeg>=0.5
