@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -30,6 +31,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSpinBox,
+    QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -48,9 +51,15 @@ DEFAULTS: dict[str, Any] = {
     "rvc_filter_radius": 3,
     "rvc_protect": 0.33,
     "rvc_rms_mix_rate": 0.5,
+    "playback_device": "",  # empty = Windows default output
 }
 
-F0_METHODS = ["rmvpe", "fcpe", "crepe", "harvest", "dio", "pm"]
+# fcpe was removed — on some GPU/driver combos it segfaults the CUDA context
+# (process can't recover without a Windows reboot). The remaining 5 methods
+# cover the same use cases. Legacy "fcpe" values in clipboard_actions.json
+# are coerced to "rmvpe" at runtime (see respeaker_client._load_engine) and
+# purged from JSON on next save (see VoiceSettingsPanel.set_values).
+F0_METHODS = ["rmvpe", "crepe", "harvest", "dio", "pm"]
 
 TOOLTIPS: dict[str, str] = {
     "language": (
@@ -79,7 +88,6 @@ TOOLTIPS: dict[str, str] = {
     "rvc_f0_method": (
         "Algorithm used to extract pitch from the TTS audio.\n\n"
         "• rmvpe — fast + accurate, default\n"
-        "• fcpe — newer alternative to rmvpe\n"
         "• crepe — very accurate, slower\n"
         "• harvest — robust, slow\n"
         "• dio / pm — fastest but less accurate"
@@ -101,23 +109,44 @@ TOOLTIPS: dict[str, str] = {
         "0.0 = follow the original TTS volume curve. 1.0 = use the model "
         "voice's volume curve. 0.5 splits the difference."
     ),
+    "playback_device": (
+        "Which Windows output device receives the generated audio.\n\n"
+        "Leave at (System default) to play through your speakers/"
+        "headphones. Pick a virtual cable (e.g. CABLE Input from VB-Audio "
+        "Cable) so OBS or any capture app can grab the audio as an "
+        "isolated source via the cable's recording side.\n\n"
+        "Use the ↻ button to refresh after plugging in a new device."
+    ),
 }
 
 
-def _info_dot(tooltip: str) -> QLabel:
-    """Tiny `(?)` circle that surfaces a tooltip on hover."""
-    dot = QLabel("?")
-    dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    dot.setFixedSize(14, 14)
-    dot.setCursor(Qt.CursorShape.WhatsThisCursor)
-    dot.setStyleSheet(
-        f"QLabel{{background:{COLOR.surface_3}; color:{COLOR.text_2};"
-        f" border-radius:7px; font-size:9px; font-weight:600;}}"
-        f"QLabel:hover{{background:{COLOR.violet_soft};"
+def _info_dot(tooltip: str) -> QToolButton:
+    """Tiny `(?)` circle that surfaces the tooltip on hover AND on click.
+
+    Hover-only tooltips are unreliable on the popups that host this panel
+    (Tool + frameless + translucent windows can swallow Qt's tooltip events
+    silently). QToolButton handles hover better than QLabel, and the click
+    handler explicitly pops the tooltip via QToolTip.showText as a
+    belt-and-braces fallback — so the help text always reachable.
+    """
+    btn = QToolButton()
+    btn.setText("?")
+    btn.setFixedSize(14, 14)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    btn.setAutoRaise(True)
+    btn.setStyleSheet(
+        f"QToolButton{{background:{COLOR.surface_3}; color:{COLOR.text_2};"
+        f" border:none; border-radius:7px; font-size:9px; font-weight:600;"
+        f" padding:0px; margin:0px;}}"
+        f"QToolButton:hover{{background:{COLOR.violet_soft};"
         f" color:{COLOR.violet};}}"
     )
-    dot.setToolTip(tooltip)
-    return dot
+    btn.setToolTip(tooltip)
+    btn.clicked.connect(
+        lambda *_a, _t=tooltip, _b=btn: QToolTip.showText(QCursor.pos(), _t, _b)
+    )
+    return btn
 
 
 def _label_row(text: str, tooltip: str) -> QWidget:
@@ -150,7 +179,7 @@ class VoiceSettingsPanel(QWidget):
     expandedChanged = pyqtSignal(bool)
 
     COLLAPSED_HEIGHT = 30
-    EXPANDED_HEIGHT = 296
+    EXPANDED_HEIGHT = 332
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -201,12 +230,42 @@ class VoiceSettingsPanel(QWidget):
             f" color:{COLOR.text_1}; selection-background-color:{COLOR.violet};"
             f" border:1px solid {COLOR.line};}}"
         )
+        # NOTE: Once you stylesheet a QSpinBox at all, Qt drops the default
+        # rendering of the ::up-button / ::down-button sub-controls — they
+        # collapse to zero width and become unclickable. We have to declare
+        # them explicitly. CSS triangle hack avoids needing image assets.
         spin_qss = (
             f"QSpinBox, QDoubleSpinBox{{background:{COLOR.surface_2};"
             f" color:{COLOR.text_1}; border:1px solid {COLOR.line};"
-            f" border-radius:6px; padding:2px 4px; font-size:11px;"
-            f" min-height:20px; min-width:80px;}}"
+            f" border-radius:6px; padding:2px 22px 2px 6px; font-size:11px;"
+            f" min-height:24px; min-width:80px;}}"
             f"QSpinBox:hover, QDoubleSpinBox:hover{{border-color:{COLOR.violet};}}"
+            f"QSpinBox::up-button, QDoubleSpinBox::up-button{{"
+            f" subcontrol-origin:border; subcontrol-position:top right;"
+            f" width:16px; height:12px;"
+            f" border-left:1px solid {COLOR.line};"
+            f" border-bottom:1px solid {COLOR.line};"
+            f" border-top-right-radius:5px;"
+            f" background:{COLOR.surface_3};}}"
+            f"QSpinBox::down-button, QDoubleSpinBox::down-button{{"
+            f" subcontrol-origin:border; subcontrol-position:bottom right;"
+            f" width:16px; height:12px;"
+            f" border-left:1px solid {COLOR.line};"
+            f" border-bottom-right-radius:5px;"
+            f" background:{COLOR.surface_3};}}"
+            f"QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,"
+            f" QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover"
+            f"{{background:{COLOR.violet_soft};}}"
+            f"QSpinBox::up-arrow, QDoubleSpinBox::up-arrow{{"
+            f" image:none; width:0px; height:0px;"
+            f" border-left:4px solid transparent;"
+            f" border-right:4px solid transparent;"
+            f" border-bottom:4px solid {COLOR.text_2};}}"
+            f"QSpinBox::down-arrow, QDoubleSpinBox::down-arrow{{"
+            f" image:none; width:0px; height:0px;"
+            f" border-left:4px solid transparent;"
+            f" border-right:4px solid transparent;"
+            f" border-top:4px solid {COLOR.text_2};}}"
         )
 
         # Language
@@ -274,6 +333,30 @@ class VoiceSettingsPanel(QWidget):
         self._rms_spin.valueChanged.connect(self._on_any_changed)
         form.addRow(_label_row("RMS mix rate", TOOLTIPS["rvc_rms_mix_rate"]), self._rms_spin)
 
+        # Playback device — combo + refresh button in a horizontal pair.
+        device_row = QWidget(host)
+        device_h = QHBoxLayout(device_row)
+        device_h.setContentsMargins(0, 0, 0, 0)
+        device_h.setSpacing(4)
+        self._device_combo = QComboBox(device_row)
+        self._device_combo.setStyleSheet(combo_qss)
+        self._device_combo.currentIndexChanged.connect(self._on_any_changed)
+        device_h.addWidget(self._device_combo, 1)
+        self._device_refresh_btn = QPushButton("↻", device_row)
+        self._device_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._device_refresh_btn.setFixedSize(24, 24)
+        self._device_refresh_btn.setToolTip("Re-scan output devices")
+        self._device_refresh_btn.setStyleSheet(
+            f"QPushButton{{background:{COLOR.surface_3}; color:{COLOR.text_2};"
+            f" border:1px solid {COLOR.line}; border-radius:6px; font-size:13px;}}"
+            f"QPushButton:hover{{color:{COLOR.violet};"
+            f" border-color:{COLOR.violet_line};}}"
+        )
+        self._device_refresh_btn.clicked.connect(self._refresh_devices)
+        device_h.addWidget(self._device_refresh_btn)
+        self._refill_device_combo()
+        form.addRow(_label_row("Playback device", TOOLTIPS["playback_device"]), device_row)
+
         # Reset row
         reset_row = QWidget(host)
         rh = QHBoxLayout(reset_row)
@@ -308,6 +391,7 @@ class VoiceSettingsPanel(QWidget):
                     s[k] = v
 
         self._suppress = True
+        coerced = False  # set if we had to silently fix a stale saved value
         try:
             # Language + voice — set language first so the voice combo is repopulated.
             lang = tts_voice_catalog.find_language(s["base_voice"]) or tts_voice_catalog.languages()[0]
@@ -321,20 +405,53 @@ class VoiceSettingsPanel(QWidget):
 
             self._pitch_spin.setValue(int(s["rvc_pitch"]))
             self._index_spin.setValue(float(s["rvc_index_rate"]))
-            f0_idx = self._f0_combo.findText(str(s["rvc_f0_method"]))
+            # F0 method: if the saved value is no longer in F0_METHODS (e.g.
+            # legacy "fcpe"), force the combo to the default and flag a
+            # post-emit so the bad value gets purged from JSON.
+            saved_f0 = str(s["rvc_f0_method"])
+            f0_idx = self._f0_combo.findText(saved_f0)
+            if f0_idx < 0:
+                coerced = True
+                f0_idx = self._f0_combo.findText(str(DEFAULTS["rvc_f0_method"]))
             if f0_idx >= 0:
                 self._f0_combo.setCurrentIndex(f0_idx)
             self._filter_spin.setValue(int(s["rvc_filter_radius"]))
             self._protect_spin.setValue(float(s["rvc_protect"]))
             self._rms_spin.setValue(float(s["rvc_rms_mix_rate"]))
+
+            # Match the saved playback device by its stored substring, or fall
+            # back to (System default) when the device is no longer present.
+            # Try an exact match first (covers same-machine reloads); fall
+            # back to a substring match (covers minor driver-side renames so
+            # the user doesn't see "device reset to default" after a Windows
+            # audio-driver update).
+            wanted = str(s.get("playback_device") or "")
+            idx = self._device_combo.findData(wanted)
+            if idx < 0 and wanted:
+                needle = wanted.lower()
+                for i in range(self._device_combo.count()):
+                    data = self._device_combo.itemData(i)
+                    if isinstance(data, str) and data and needle in data.lower():
+                        idx = i
+                        break
+            if idx < 0:
+                idx = 0
+            self._device_combo.setCurrentIndex(idx)
         finally:
             self._suppress = False
+
+        # If we coerced a stale value, fire settingsChanged so the controller
+        # writes the cleaned-up dict back to clipboard_actions.json. Doing
+        # this outside the suppression block is intentional.
+        if coerced:
+            self.settingsChanged.emit(self.current_values())
 
     def current_values(self) -> dict[str, Any]:
         """Snapshot of all controls — keys match `Item` fields."""
         voice_id = self._voice_combo.currentData()
         if not voice_id:
             voice_id = DEFAULTS["base_voice"]
+        device = self._device_combo.currentData()
         return {
             "base_voice": voice_id,
             "rvc_pitch": int(self._pitch_spin.value()),
@@ -343,6 +460,7 @@ class VoiceSettingsPanel(QWidget):
             "rvc_filter_radius": int(self._filter_spin.value()),
             "rvc_protect": round(float(self._protect_spin.value()), 4),
             "rvc_rms_mix_rate": round(float(self._rms_spin.value()), 4),
+            "playback_device": device if isinstance(device, str) else "",
         }
 
     def reset_to_defaults(self) -> None:
@@ -395,3 +513,45 @@ class VoiceSettingsPanel(QWidget):
                 self._voice_combo.addItem(label, voice_id)
         finally:
             self._voice_combo.blockSignals(False)
+
+    def _refill_device_combo(self) -> None:
+        """Populate the playback-device combo from sounddevice's output list.
+
+        Stores the device *name* string as item data (not the integer index)
+        because indices are not stable across reboots / hotplug, but names
+        are stable enough for our substring-match resolver.
+        """
+        self._device_combo.blockSignals(True)
+        try:
+            self._device_combo.clear()
+            self._device_combo.addItem("(System default)", "")
+            try:
+                import sounddevice as sd  # lazy — heavy import
+                for dev in sd.query_devices():
+                    try:
+                        if dev.get("max_output_channels", 0) <= 0:
+                            continue
+                        name = str(dev.get("name", "")).strip()
+                        if not name:
+                            continue
+                        self._device_combo.addItem(name, name)
+                    except (AttributeError, TypeError):
+                        continue
+            except Exception:
+                # No sounddevice / no audio backend — leave the combo with
+                # just the default entry; user will see that and know the
+                # picker is non-functional on this machine.
+                pass
+        finally:
+            self._device_combo.blockSignals(False)
+
+    def _refresh_devices(self) -> None:
+        """Re-scan devices and try to preserve the current selection."""
+        current = self._device_combo.currentData()
+        self._suppress = True
+        try:
+            self._refill_device_combo()
+            idx = self._device_combo.findData(current if isinstance(current, str) else "")
+            self._device_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self._suppress = False

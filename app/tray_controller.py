@@ -357,18 +357,32 @@ class TrayController(QObject):
             self._window.voiceSettingsChanged.connect(
                 lambda d: self._on_voice_settings_changed("sys-voice-respeaker", d)
             )
+            # Recorder's Replay button uses the same plumbing as TTS's:
+            # forward to the worker's replayWav slot via the existing
+            # replayRequested signal so we don't need a parallel pipeline.
+            self._window.replayRequested.connect(self._on_recorder_replay_requested)
         self._window.present(mode=mode)
 
     def _on_window_destroyed(self, *_args) -> None:
         self._window = None
 
     def _on_recording_stopped(self, audio: bytes) -> None:
-        if self._window is not None:
+        # In respeaker mode the window stays open through TRANSCRIBING → DONE
+        # so the user can hit Replay / Save after the cloned voice plays.
+        # Online + offline modes have no follow-up, so shut down immediately.
+        if self._pending_mode != MODE_RESPEAKER and self._window is not None:
             try:
                 self._window.shutdown()
             except Exception:
                 pass
         if not audio:
+            # If we kept the window open for respeaker mode, close it now
+            # since there's nothing to transcribe.
+            if self._window is not None:
+                try:
+                    self._window.shutdown()
+                except Exception:
+                    pass
             self._toast("Recording too short", QSystemTrayIcon.MessageIcon.Warning)
             return
         self._refresh_tooltip()
@@ -399,6 +413,13 @@ class TrayController(QObject):
 
     def _on_transcript_failed(self, msg: str) -> None:
         self._refresh_tooltip()
+        # In respeaker mode the recorder window stayed open through
+        # transcription; close it on failure so the user isn't trapped.
+        if self._window is not None and self._window.isVisible():
+            try:
+                self._window.shutdown()
+            except Exception:
+                pass
         self._toast(msg, QSystemTrayIcon.MessageIcon.Critical, title="Transcription failed")
 
     def _on_respeak_done(self, wav_path: str) -> None:
@@ -407,12 +428,34 @@ class TrayController(QObject):
         if self._tts_window is not None and self._tts_window.isVisible():
             self._tts_window.set_last_wav(wav_path)
             self._tts_window.set_busy(False, "Done. Type more to convert again.")
+        # Ctrl+Alt+5 keeps its window open through DONE so the user can
+        # replay / save — flip it into DONE state now.
+        if self._window is not None and self._window.isVisible():
+            try:
+                self._window.set_done(wav_path)
+            except Exception:
+                pass
+
+    def _on_recorder_replay_requested(self, wav_path: str) -> None:
+        """Bridge the recorder's Replay button → existing replay pipeline."""
+        if self._respeak_busy:
+            return
+        self._respeak_busy = True
+        self.replayRequested.emit(wav_path)
 
     def _on_respeak_failed(self, msg: str) -> None:
         self._respeak_busy = False
         self._refresh_tooltip()
         if self._tts_window is not None and self._tts_window.isVisible():
             self._tts_window.set_busy(False, f"Failed: {msg}")
+        # Recorder window (Ctrl+Alt+5 respeaker mode) is stuck in
+        # TRANSCRIBING — close it so the user isn't trapped. The toast
+        # below carries the error context.
+        if self._window is not None and self._window.isVisible():
+            try:
+                self._window.shutdown()
+            except Exception:
+                pass
         self._toast(msg, QSystemTrayIcon.MessageIcon.Critical, title="Re-speaker failed")
 
     # ── TTS window (Ctrl+Alt+6) ─────────────────────────────────
@@ -736,6 +779,7 @@ _VOICE_SETTING_FIELDS = (
     "rvc_filter_radius",
     "rvc_protect",
     "rvc_rms_mix_rate",
+    "playback_device",
 )
 
 

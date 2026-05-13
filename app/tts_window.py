@@ -9,6 +9,8 @@ RespeakerWorker (edge-tts → RVC → play).
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 
 from PyQt6.QtCore import (
     QEvent,
@@ -19,6 +21,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QCursor, QGuiApplication, QKeyEvent
 from PyQt6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -256,6 +259,14 @@ class TtsWindow(QWidget):
 
         f.addStretch(1)
 
+        self._save_btn = QPushButton("💾 Save audio")
+        self._save_btn.setProperty("class", "btn ghost")
+        self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_btn.setToolTip("Save the last generated WAV to another location (Ctrl+S)")
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._on_save_audio)
+        f.addWidget(self._save_btn)
+
         self._open_folder_btn = QPushButton("📂 Open folder")
         self._open_folder_btn.setProperty("class", "btn ghost")
         self._open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -294,17 +305,21 @@ class TtsWindow(QWidget):
         self._busy = busy
         self._submit_btn.setEnabled(not busy)
         self._submit_btn.setText("Working…" if busy else "Convert TTS")
-        # Replay button: disabled while busy AND when no WAV has been produced yet.
-        self._replay_btn.setEnabled(not busy and bool(self._last_wav))
+        # Replay + Save: gated by both busy state AND having a generated WAV.
+        can_use_last = not busy and bool(self._last_wav)
+        self._replay_btn.setEnabled(can_use_last)
+        self._save_btn.setEnabled(can_use_last)
         if status:
             self._status_label.setText(status)
 
     def set_last_wav(self, path: str) -> None:
-        """Record the most-recent generation so the user can replay it."""
+        """Record the most-recent generation so the user can replay/save it."""
         self._last_wav = path or None
-        # If we're not currently busy, light up the replay button.
+        # If we're not currently busy, light up the replay + save buttons.
         if not self._busy:
-            self._replay_btn.setEnabled(bool(self._last_wav))
+            has_wav = bool(self._last_wav)
+            self._replay_btn.setEnabled(has_wav)
+            self._save_btn.setEnabled(has_wav)
 
     def set_status(self, text: str) -> None:
         self._status_label.setText(text)
@@ -382,6 +397,32 @@ class TtsWindow(QWidget):
         except Exception as e:
             self._status_label.setText(f"Could not open folder: {e}")
 
+    def _on_save_audio(self) -> None:
+        """Save-As dialog → copy the last generated WAV to a user-chosen path."""
+        if self._busy or not self._last_wav:
+            return
+        src = Path(self._last_wav)
+        if not src.exists():
+            self._status_label.setText("Last clip no longer exists on disk.")
+            return
+        # Suggest Documents/<original-basename>.wav so the dialog opens
+        # somewhere sensible and pre-fills a meaningful name.
+        documents = Path.home() / "Documents"
+        if not documents.exists():
+            documents = Path.home()
+        suggested = str(documents / src.name)
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save audio as…", suggested, "WAV files (*.wav);;All files (*.*)"
+        )
+        if not dest:
+            return
+        try:
+            shutil.copy2(str(src), dest)
+        except OSError as e:
+            self._status_label.setText(f"Save failed: {e}")
+            return
+        self._status_label.setText(f"Saved to {Path(dest).name}")
+
     def _on_close(self) -> None:
         self.closeRequested.emit()
         self.hide()
@@ -401,6 +442,9 @@ class TtsWindow(QWidget):
             return
         if key == Qt.Key.Key_P and (mods & Qt.KeyboardModifier.ControlModifier):
             self._on_replay()
+            return
+        if key == Qt.Key.Key_S and (mods & Qt.KeyboardModifier.ControlModifier):
+            self._on_save_audio()
             return
         super().keyPressEvent(event)
 

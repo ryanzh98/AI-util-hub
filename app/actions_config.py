@@ -39,6 +39,11 @@ class Item:
     rvc_filter_radius: Optional[int] = None
     rvc_protect: Optional[float] = None
     rvc_rms_mix_rate: Optional[float] = None
+    # Substring of a Windows output device name (e.g. "CABLE Input") — when
+    # set, playback routes here instead of the system default so OBS / other
+    # capture apps can pick the audio up via the device's recording side.
+    # None or "" means "use system default" (today's behavior).
+    playback_device: Optional[str] = None
 
 
 @dataclass

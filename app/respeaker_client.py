@@ -43,6 +43,32 @@ _DEFAULT_F0_METHOD = "rmvpe"
 _DEFAULT_PITCH = 0
 _DEFAULT_INDEX_RATE = 0.75
 
+# fcpe is intentionally excluded — segfaults the CUDA driver on some GPU
+# combos and the only recovery is a Windows reboot. Anything else falls
+# back to rmvpe via _coerce_f0_method().
+_F0_ALLOWED = {"rmvpe", "crepe", "harvest", "dio", "pm"}
+_F0_COERCED_ONCE = False
+
+
+def _coerce_f0_method(name: str) -> str:
+    """Silently swap unsupported f0 methods (esp. legacy 'fcpe') for rmvpe.
+
+    Logs the swap once per process so we have a breadcrumb without spamming
+    stderr when the same hotkey fires repeatedly.
+    """
+    global _F0_COERCED_ONCE
+    cleaned = (name or "").strip().lower()
+    if cleaned in _F0_ALLOWED:
+        return cleaned
+    if not _F0_COERCED_ONCE:
+        import sys as _sys
+        print(
+            f"[respeaker] f0_method '{name}' is unsupported here; using rmvpe.",
+            file=_sys.stderr,
+        )
+        _F0_COERCED_ONCE = True
+    return _DEFAULT_F0_METHOD
+
 
 _ENGINE = None  # type: ignore[var-annotated]
 _ENGINE_KEY: tuple[str, str, str, str] | None = None  # (model, index, device, f0_method)
@@ -202,6 +228,7 @@ def _load_engine(
         )
         device = _default("RESPEAKER_DEVICE", _DEFAULT_DEVICE)
         resolved_f0 = (f0_method or "").strip() or _default("RESPEAKER_F0_METHOD", _DEFAULT_F0_METHOD)
+        resolved_f0 = _coerce_f0_method(resolved_f0)
         key = (resolved_model, resolved_index, device, resolved_f0)
 
         if _ENGINE is not None and _ENGINE_KEY == key:
@@ -376,11 +403,50 @@ def respeak(
     return str(Path(path).resolve())
 
 
-def play_wav(wav_path: str) -> None:
-    """Play a WAV file through the default output device. Blocks until done.
+def _resolve_output_device(name: str | None):
+    """Substring-match `name` against sounddevice output devices.
 
-    Raises RuntimeError on failure. Loads soundfile + sounddevice lazily so the
-    process can start without them when not in use.
+    Returns the matching device's integer index, or None if `name` is empty
+    or no match exists. On no-match we log to stderr and fall back to the
+    default (better UX than silent-fail-with-no-sound).
+    """
+    if not name or not name.strip():
+        return None
+    needle = name.strip().lower()
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    for idx, dev in enumerate(devices):
+        try:
+            if dev.get("max_output_channels", 0) <= 0:
+                continue
+            if needle in str(dev.get("name", "")).lower():
+                return idx
+        except (AttributeError, TypeError):
+            continue
+    import sys as _sys
+    print(
+        f"[respeaker] Output device '{name}' not found — using system default.",
+        file=_sys.stderr,
+    )
+    return None
+
+
+def play_wav(wav_path: str, *, device: str | None = None) -> None:
+    """Play a WAV file. Blocks until done.
+
+    When `device` is None/empty, plays through the Windows default output
+    (today's behavior). Otherwise resolves `device` to a sounddevice output
+    index by substring name match and routes audio there. Unknown device
+    names fall back to default with a stderr warning.
+
+    Raises RuntimeError on failure. Loads soundfile + sounddevice lazily so
+    the process can start without them when not in use.
     """
     try:
         import soundfile as sf
@@ -393,8 +459,12 @@ def play_wav(wav_path: str) -> None:
     except Exception as e:
         raise RuntimeError(f"Failed to read WAV {wav_path}: {e}")
 
+    device_idx = _resolve_output_device(device)
     try:
-        sd.play(data, samplerate)
+        if device_idx is None:
+            sd.play(data, samplerate)
+        else:
+            sd.play(data, samplerate, device=device_idx)
         sd.wait()
     except Exception as e:
         raise RuntimeError(f"Audio playback failed: {e}")
@@ -404,6 +474,13 @@ class RespeakerWorker(QObject):
     done = pyqtSignal(str)  # emits the played WAV path
     failed = pyqtSignal(str)
     statusChanged = pyqtSignal(str)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        # Most-recent playback device name — used so replayWav routes to the
+        # same destination as the original synthesis without needing a new
+        # signal signature.
+        self._last_device: str | None = None
 
     @pyqtSlot(str)
     def speak(self, text: str) -> None:
@@ -427,15 +504,15 @@ class RespeakerWorker(QObject):
     def replayWav(self, wav_path: str) -> None:
         """Re-play an already-generated WAV without re-synthesizing.
 
-        Reuses the same done/failed signals so the controller's busy-gate and
-        status plumbing don't need a separate code path.
+        Routes to the same device as the most recent _run() (or system
+        default if nothing has played yet).
         """
         if not wav_path or not Path(wav_path).exists():
             self.failed.emit(f"WAV not found: {wav_path}")
             return
         try:
             self.statusChanged.emit("Playing…")
-            play_wav(wav_path)
+            play_wav(wav_path, device=self._last_device)
         except RuntimeError as e:
             self.failed.emit(str(e))
             return
@@ -453,9 +530,11 @@ class RespeakerWorker(QObject):
         except RuntimeError as e:
             self.failed.emit(str(e))
             return
+        device = (settings or {}).get("playback_device") or None
+        self._last_device = device
         try:
             self.statusChanged.emit("Playing…")
-            play_wav(wav_path)
+            play_wav(wav_path, device=device)
         except RuntimeError as e:
             self.failed.emit(str(e))
             return

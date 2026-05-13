@@ -9,6 +9,8 @@ preserved 1:1 from the prior implementation — only the chrome changes.
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 
 from PyQt6.QtCore import (
     QByteArray,
@@ -24,6 +26,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QCursor, QGuiApplication
 from PyQt6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -100,6 +103,7 @@ class RecorderWindow(QWidget):
     recordingCancelled = pyqtSignal()
     voiceChanged = pyqtSignal(str, str, str)  # (label, model_path, index_path)
     voiceSettingsChanged = pyqtSignal(dict)  # full per-hotkey TTS+RVC dict
+    replayRequested = pyqtSignal(str)  # absolute WAV path to re-play
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -118,6 +122,7 @@ class RecorderWindow(QWidget):
         self._elapsed_ms = 0
         self._state = RecorderState.IDLE
         self._mode = "online"
+        self._last_wav: str | None = None  # set by set_done() in respeaker DONE
         self._recorder = AudioRecorder()
         self._speaker_mute = SpeakerMute()
 
@@ -459,6 +464,45 @@ class RecorderWindow(QWidget):
         self._stop_btn.clicked.connect(self._on_stop)
         f.addWidget(self._stop_btn)
 
+        # DONE-state buttons — appear after the cloned voice has played in
+        # respeaker mode. Sized + styled like the rec-btn family but ghosted
+        # so they don't compete with the primary action.
+        done_btn_qss = (
+            f"QPushButton{{background:{COLOR.surface_3}; color:{COLOR.text_1};"
+            f" border:1px solid {COLOR.line}; border-radius:8px;"
+            f" padding:5px 12px; font-size:11px;}}"
+            f"QPushButton:hover{{border-color:{COLOR.violet};"
+            f" color:{COLOR.violet};}}"
+            f"QPushButton:disabled{{color:{COLOR.text_4};}}"
+        )
+
+        self._replay_btn = QPushButton("▶ Replay")
+        self._replay_btn.setProperty("class", "rec-btn replay")
+        self._replay_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._replay_btn.setToolTip("Replay the cloned voice")
+        self._replay_btn.setStyleSheet(done_btn_qss)
+        self._replay_btn.clicked.connect(self._on_replay)
+        self._replay_btn.setVisible(False)
+        f.insertWidget(1, self._replay_btn)  # right after Cancel
+
+        self._save_btn = QPushButton("💾 Save audio")
+        self._save_btn.setProperty("class", "rec-btn save")
+        self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_btn.setToolTip("Save the cloned voice WAV to another location")
+        self._save_btn.setStyleSheet(done_btn_qss)
+        self._save_btn.clicked.connect(self._on_save_audio)
+        self._save_btn.setVisible(False)
+        f.insertWidget(2, self._save_btn)  # after Replay
+
+        self._done_close_btn = QPushButton("Close")
+        self._done_close_btn.setProperty("class", "rec-btn close")
+        self._done_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._done_close_btn.setToolTip("Close (Esc)")
+        self._done_close_btn.setStyleSheet(done_btn_qss)
+        self._done_close_btn.clicked.connect(lambda: self.close())
+        self._done_close_btn.setVisible(False)
+        f.addWidget(self._done_close_btn)
+
         parent_layout.addWidget(footer)
 
     # ── animations ───────────────────────────────────────────
@@ -511,6 +555,17 @@ class RecorderWindow(QWidget):
 
         self._elapsed_ms = 0
         self._update_timer_label()
+        self._mode = mode
+        self._last_wav = None
+        # Reset DONE-state buttons to hidden on every fresh present().
+        self._replay_btn.setVisible(False)
+        self._save_btn.setVisible(False)
+        self._done_close_btn.setVisible(False)
+        self._cancel_btn.setVisible(True)
+        self._pause_btn.setVisible(True)
+        self._stop_btn.setVisible(True)
+        self._cancel_btn.setEnabled(True)
+        self._stop_btn.setEnabled(True)
 
         # Mode chip text + online/offline gating. Respeaker uses the same local
         # Whisper as offline, then pipes the transcript through TTS+RVC.
@@ -646,6 +701,20 @@ class RecorderWindow(QWidget):
             self._pause_btn.setEnabled(False)
             self._stop_btn.setEnabled(False)
             self._cancel_btn.setEnabled(False)
+        elif new_state == RecorderState.DONE:
+            # Respeaker post-playback: swap the action buttons. The live
+            # pill becomes "DONE"; the wave is frozen low to signal "no
+            # active recording".
+            self._live_label.setText("DONE")
+            self._stop_wave(freeze_low=True)
+            self._cancel_btn.setVisible(False)
+            self._pause_btn.setVisible(False)
+            self._stop_btn.setVisible(False)
+            self._replay_btn.setVisible(True)
+            self._save_btn.setVisible(True)
+            self._done_close_btn.setVisible(True)
+            self._replay_btn.setEnabled(bool(self._last_wav))
+            self._save_btn.setEnabled(bool(self._last_wav))
         elif new_state == RecorderState.IDLE:
             self._live_label.setText("REC")
             self._stop_wave(freeze_low=True)
@@ -673,13 +742,64 @@ class RecorderWindow(QWidget):
             self._set_state(RecorderState.RECORDING)
 
     def _on_stop(self) -> None:
-        if self._state in (RecorderState.RECORDING, RecorderState.PAUSED):
-            audio = self._recorder.stop()
-            self._set_state(RecorderState.TRANSCRIBING)
-            self.recordingStopped.emit(audio)
+        if self._state not in (RecorderState.RECORDING, RecorderState.PAUSED):
+            return
+        audio = self._recorder.stop()
+        self._set_state(RecorderState.TRANSCRIBING)
+        self.recordingStopped.emit(audio)
+        # Respeaker mode keeps the window open through TRANSCRIBING → DONE
+        # so the user can Replay / Save the cloned WAV. Online / offline
+        # modes have no follow-up audio, so close immediately as before.
+        if self._mode != "respeaker":
             self.close()
 
+    def _on_replay(self) -> None:
+        if self._state != RecorderState.DONE or not self._last_wav:
+            return
+        self.replayRequested.emit(self._last_wav)
+
+    def _on_save_audio(self) -> None:
+        if self._state != RecorderState.DONE or not self._last_wav:
+            return
+        src = Path(self._last_wav)
+        if not src.exists():
+            return
+        documents = Path.home() / "Documents"
+        if not documents.exists():
+            documents = Path.home()
+        suggested = str(documents / src.name)
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save audio as…", suggested, "WAV files (*.wav);;All files (*.*)"
+        )
+        if not dest:
+            return
+        try:
+            shutil.copy2(str(src), dest)
+        except OSError:
+            # Silently swallow — there's no status label on this window's
+            # current chrome. If saving fails the user can use Open folder
+            # / file manager. (Could surface via a toast later.)
+            return
+
+    def set_done(self, wav_path: str) -> None:
+        """Switch to DONE state and show Replay / Save / Close buttons.
+
+        Called by the tray controller's _on_respeak_done for the recorder
+        flow (respeaker mode only). Storing the path lets Replay re-fire
+        playback through RespeakerWorker.replayWav without re-recording.
+        """
+        if self._mode != "respeaker":
+            return
+        self._last_wav = wav_path or None
+        self._set_state(RecorderState.DONE)
+
     def _on_cancel(self) -> None:
+        # DONE state: recording already finished, suppress the cancelled
+        # signal so the controller doesn't try to roll back state that no
+        # longer exists.
+        if self._state == RecorderState.DONE:
+            self.close()
+            return
         try:
             self._recorder.stop()
         except Exception:
@@ -691,6 +811,15 @@ class RecorderWindow(QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
+        # In DONE state the recording is finished, so Esc must NOT fire
+        # recordingCancelled (which would race with tray_controller's
+        # already-completed flow). Just close the window.
+        if self._state == RecorderState.DONE:
+            if key == Qt.Key.Key_Escape:
+                self.close()
+                return
+            super().keyPressEvent(event)
+            return
         if key == Qt.Key.Key_Escape:
             self._on_cancel()
         elif key == Qt.Key.Key_Space:

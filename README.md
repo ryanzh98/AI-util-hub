@@ -80,6 +80,16 @@ All runtime config lives in `.env`. See `.env.example` for the full annotated li
 
 `install_and_run.bat` pre-warms the engine on first install, so the first `Ctrl+Alt+5` fire is already instant. HuBERT + RMVPE pretrains (~370 MB) land at the project root; if they ever go missing, re-run the installer to fetch them again.
 
+### Routing TTS audio into OBS
+
+`Ctrl+Alt+5` and `Ctrl+Alt+6` play through the Windows default output, which OBS's *Application Audio Output Capture* often misses because `pythonw.exe` is a background process. For a reliable, isolated OBS track:
+
+1. Install **[VB-Audio Cable](https://vb-audio.com/Cable/)** (free, single installer).
+2. Open the Ctrl+Alt+5 or Ctrl+Alt+6 popup → **Advanced voice settings** → set **Playback device** to the `CABLE In…` entry (Windows truncates the name; the exact label varies by VB-Cable version, but pick whichever option contains `CABLE In` or `VB-Audio`). Setting is per-hotkey and persisted in `clipboard_actions.json`.
+3. In OBS, add an **Audio Input Capture** source → device = `CABLE Output (VB-Audio Virtual Cable)`. You now have a dedicated OBS track with its own volume + filters.
+
+To still hear the audio locally while OBS captures it, enable *Audio Monitoring* on the OBS source (Audio Mixer → ⚙ → Advanced Audio Properties → Audio Monitoring = "Monitor and Output").
+
 ## Configuring shortcuts
 
 Right-click the tray icon → **Manage shortcuts…** opens the manager window. You can:
