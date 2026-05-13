@@ -1,4 +1,5 @@
-Microphone glyph adapted from Lucide (https://lucide.dev), ISC License.
+In-window UI glyphs (microphone, play, pause, stop, close) inlined in
+design/icons.py are adapted from Lucide (https://lucide.dev), ISC License.
 
 ISC License
 

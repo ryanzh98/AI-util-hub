@@ -206,6 +206,6 @@ corresponding source code of your modified version.
 
 Third-party assets keep their own licenses:
 
-- Microphone tray icon adapted from Lucide (ISC) — see `assets/LICENSE-icons.txt`.
+- In-window UI glyphs (mic, play, pause, stop, close) adapted from Lucide (ISC) — see `assets/LICENSE-icons.txt`.
 - RVC voice models are user-supplied and carry their own licenses — check each model card.
 - `tts-with-rvc`, `faster-whisper`, `PyQt6`, etc. are upstream packages — see `requirements.txt`.
