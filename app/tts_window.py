@@ -8,6 +8,8 @@ RespeakerWorker (edge-tts → RVC → play).
 
 from __future__ import annotations
 
+import os
+
 from PyQt6.QtCore import (
     QEvent,
     QPoint,
@@ -30,6 +32,7 @@ from design import COLOR
 from design.effects import fade_in
 
 from . import voice_catalog
+from .respeaker_client import resolve_output_dir
 from .voice_settings_panel import VoiceSettingsPanel
 
 
@@ -57,11 +60,13 @@ class TtsWindow(QWidget):
     textSubmitted = pyqtSignal(str)
     voiceChanged = pyqtSignal(str, str, str)
     voiceSettingsChanged = pyqtSignal(dict)  # full per-hotkey TTS+RVC dict
+    replayRequested = pyqtSignal(str)  # absolute WAV path to re-play
     closeRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._voices: list[voice_catalog.Voice] = []
+        self._last_wav: str | None = None
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.Tool
@@ -241,7 +246,22 @@ class TtsWindow(QWidget):
         self._clear_btn.clicked.connect(lambda: self._text.clear())
         f.addWidget(self._clear_btn)
 
+        self._replay_btn = QPushButton("▶ Play again")
+        self._replay_btn.setProperty("class", "btn ghost")
+        self._replay_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._replay_btn.setToolTip("Replay last generation (Ctrl+P)")
+        self._replay_btn.setEnabled(False)
+        self._replay_btn.clicked.connect(self._on_replay)
+        f.addWidget(self._replay_btn)
+
         f.addStretch(1)
+
+        self._open_folder_btn = QPushButton("📂 Open folder")
+        self._open_folder_btn.setProperty("class", "btn ghost")
+        self._open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open_folder_btn.setToolTip("Open the output folder in Explorer")
+        self._open_folder_btn.clicked.connect(self._on_open_folder)
+        f.addWidget(self._open_folder_btn)
 
         self._submit_btn = QPushButton("Convert TTS")
         self._submit_btn.setProperty("class", "btn primary")
@@ -274,8 +294,17 @@ class TtsWindow(QWidget):
         self._busy = busy
         self._submit_btn.setEnabled(not busy)
         self._submit_btn.setText("Working…" if busy else "Convert TTS")
+        # Replay button: disabled while busy AND when no WAV has been produced yet.
+        self._replay_btn.setEnabled(not busy and bool(self._last_wav))
         if status:
             self._status_label.setText(status)
+
+    def set_last_wav(self, path: str) -> None:
+        """Record the most-recent generation so the user can replay it."""
+        self._last_wav = path or None
+        # If we're not currently busy, light up the replay button.
+        if not self._busy:
+            self._replay_btn.setEnabled(bool(self._last_wav))
 
     def set_status(self, text: str) -> None:
         self._status_label.setText(text)
@@ -340,6 +369,19 @@ class TtsWindow(QWidget):
         self.textSubmitted.emit(text)
         # Window does NOT close — stays open for next conversion.
 
+    def _on_replay(self) -> None:
+        if self._busy or not self._last_wav:
+            return
+        self.set_busy(True, "Replaying…")
+        self.replayRequested.emit(self._last_wav)
+
+    def _on_open_folder(self) -> None:
+        try:
+            out_dir = resolve_output_dir()
+            os.startfile(str(out_dir))  # type: ignore[attr-defined]
+        except Exception as e:
+            self._status_label.setText(f"Could not open folder: {e}")
+
     def _on_close(self) -> None:
         self.closeRequested.emit()
         self.hide()
@@ -356,6 +398,9 @@ class TtsWindow(QWidget):
             mods & Qt.KeyboardModifier.ControlModifier
         ):
             self._on_submit()
+            return
+        if key == Qt.Key.Key_P and (mods & Qt.KeyboardModifier.ControlModifier):
+            self._on_replay()
             return
         super().keyPressEvent(event)
 

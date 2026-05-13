@@ -82,6 +82,7 @@ class TrayController(QObject):
     youtubeRequested = pyqtSignal(str)
     clipboardActionRequested = pyqtSignal(str, str, float, str)
     respeakRequested = pyqtSignal(str, str, str, dict)  # text, model_path, index_path, settings
+    replayRequested = pyqtSignal(str)  # absolute WAV path to re-play
 
     def __init__(self, app: QApplication):
         super().__init__()
@@ -169,6 +170,7 @@ class TrayController(QObject):
         self._respeaker_worker = RespeakerWorker()
         self._respeaker_worker.moveToThread(self._respeaker_thread)
         self.respeakRequested.connect(self._respeaker_worker.speakWithSettings)
+        self.replayRequested.connect(self._respeaker_worker.replayWav)
         self._respeaker_worker.done.connect(self._on_respeak_done)
         self._respeaker_worker.failed.connect(self._on_respeak_failed)
         self._respeaker_worker.statusChanged.connect(self._on_local_status)
@@ -403,6 +405,7 @@ class TrayController(QObject):
         self._respeak_busy = False
         self._refresh_tooltip()
         if self._tts_window is not None and self._tts_window.isVisible():
+            self._tts_window.set_last_wav(wav_path)
             self._tts_window.set_busy(False, "Done. Type more to convert again.")
 
     def _on_respeak_failed(self, msg: str) -> None:
@@ -418,6 +421,7 @@ class TrayController(QObject):
         if self._tts_window is None:
             self._tts_window = TtsWindow()
             self._tts_window.textSubmitted.connect(self._on_tts_text_submitted)
+            self._tts_window.replayRequested.connect(self._on_tts_replay_requested)
             self._tts_window.voiceChanged.connect(
                 lambda label, mp, ip: self._on_voice_changed("sys-tts", mp, ip)
             )
@@ -466,6 +470,14 @@ class TrayController(QObject):
         mp = (it.voice_model_path or "") if it else ""
         ip = (it.voice_index_path or "") if it else ""
         self.respeakRequested.emit(text, mp, ip, _item_voice_settings(it))
+
+    def _on_tts_replay_requested(self, wav_path: str) -> None:
+        if self._respeak_busy:
+            if self._tts_window is not None:
+                self._tts_window.set_busy(True, "Another voice job is running…")
+            return
+        self._respeak_busy = True
+        self.replayRequested.emit(wav_path)
 
     def _on_local_status(self, msg: str) -> None:
         self._tray.setToolTip(f"{APP_NAME} — {msg}")

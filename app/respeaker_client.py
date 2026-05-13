@@ -78,6 +78,21 @@ def _resolve_path(value: str) -> str:
     return str(p)
 
 
+def resolve_output_dir() -> Path:
+    """Where generated WAVs land.
+
+    Reads RESPEAKER_OUTPUT_DIR; falls back to <project>/audio_output. Relative
+    paths resolve against the project root so users can drop a short value in
+    .env without surprises. Creates the directory if missing.
+    """
+    raw = os.environ.get("RESPEAKER_OUTPUT_DIR", "").strip()
+    d = Path(raw) if raw else _project_root() / "audio_output"
+    if not d.is_absolute():
+        d = _project_root() / d
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 _DLL_DIR_HANDLE = None  # keep alive — handle GC = directory removed from search
 
 
@@ -218,13 +233,12 @@ def _load_engine(
         if not Path(resolved_model).exists():
             raise RuntimeError(
                 f"RVC model not found at {resolved_model}. "
-                f"Set RESPEAKER_MODEL_PATH in .env or place a .pth file there."
+                f"Set RESPEAKER_MODEL_PATH in .env or place a .pth or .ckpt file there."
             )
 
         tmp_dir = _project_root() / "audio_temp"
-        out_dir = _project_root() / "audio_output"
+        out_dir = resolve_output_dir()
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         if status_cb is not None:
             status_cb(f"Loading voice model ({device}, {resolved_f0})…")
@@ -408,6 +422,24 @@ class RespeakerWorker(QObject):
         settings: dict,
     ) -> None:
         self._run(text, model_path, index_path, settings)
+
+    @pyqtSlot(str)
+    def replayWav(self, wav_path: str) -> None:
+        """Re-play an already-generated WAV without re-synthesizing.
+
+        Reuses the same done/failed signals so the controller's busy-gate and
+        status plumbing don't need a separate code path.
+        """
+        if not wav_path or not Path(wav_path).exists():
+            self.failed.emit(f"WAV not found: {wav_path}")
+            return
+        try:
+            self.statusChanged.emit("Playing…")
+            play_wav(wav_path)
+        except RuntimeError as e:
+            self.failed.emit(str(e))
+            return
+        self.done.emit(wav_path)
 
     def _run(self, text: str, model_path: str, index_path: str, settings: dict) -> None:
         try:

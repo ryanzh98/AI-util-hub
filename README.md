@@ -67,12 +67,13 @@ All runtime config lives in `.env`. See `.env.example` for the full annotated li
 | `RESPEAKER_PITCH`         | Semitone shift, -12..+12 (use -12 for female base → male target)     |
 | `RESPEAKER_INDEX_RATE`    | Accent-mix strength 0..1 (default 0.75)                              |
 | `RESPEAKER_DEVICE`        | `cuda:0` or `cpu`                                                    |
+| `RESPEAKER_OUTPUT_DIR`    | Where generated WAVs are saved. Default: `audio_output/` at project root |
 | `CLIPBOARD_ACTIONS_PATH`  | Override path to `clipboard_actions.json`                            |
 
 ## Voice cloning (Ctrl+Alt+5)
 
 1. `install_and_run.bat` downloads the default voice model and saves it as `models/respeaker/voice.pth` + `models/respeaker/voice.index`.
-2. **Swap voices**: drop another RVC model into `models/respeaker/`, rename the `.pth` to `voice.pth` and the `.index` to `voice.index`. No `.env` edit needed.
+2. **Swap voices**: drop another RVC model into `models/respeaker/`, rename the `.pth` to `voice.pth` and the `.index` to `voice.index`. No `.env` edit needed. Both `.pth` and `.ckpt` checkpoints are accepted (standard RVC inference format — the loader uses plain `torch.load`).
 3. Or point at a different filename by editing `RESPEAKER_MODEL_PATH` / `RESPEAKER_INDEX_PATH` in `.env`.
 4. Sources for RVC models: <https://weights.gg>, Hugging Face (`RVC` search), AI Hub Discord.
 5. **Naming gotcha when downloading raw training output**: the usable `.pth` is in the `weights/` folder. `D_*` / `G_*` files are training checkpoints — skip them. For the `.index`, pick the one starting with `added_`.

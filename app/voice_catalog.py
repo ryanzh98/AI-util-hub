@@ -14,6 +14,9 @@ from pathlib import Path
 from .paths import app_base_dir
 
 DEFAULT_LABEL = "Default"
+# The installer always writes `voice.pth`, but discovery accepts either extension
+# for user-supplied voices dropped into Sound/<subfolder>/.
+MODEL_SUFFIXES = (".pth", ".ckpt")
 DEFAULT_MODEL_REL = "models/respeaker/voice.pth"
 DEFAULT_INDEX_REL = "models/respeaker/voice.index"
 SOUND_DIR_REL = "Sound"
@@ -43,9 +46,12 @@ def _default_voice() -> Voice:
     )
 
 
-def _pick_pth(folder: Path) -> Path | None:
+def _pick_model(folder: Path) -> Path | None:
     candidates = sorted(
-        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".pth"),
+        (
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in MODEL_SUFFIXES
+        ),
         key=lambda p: p.stat().st_size,
         reverse=True,
     )
@@ -60,10 +66,10 @@ def _pick_index(folder: Path) -> Path | None:
 
 
 def list_voices() -> list[Voice]:
-    """Default first; one entry per Sound/<subdir> that has a .pth file.
+    """Default first; one entry per Sound/<subdir> that has a .pth or .ckpt file.
 
-    Picks the largest .pth in each subfolder (so e.g. `_ULTIMATE.pth` wins
-    over earlier checkpoint variants). Folders with no .pth are skipped.
+    Picks the largest model in each subfolder (so e.g. `_ULTIMATE.pth` wins
+    over earlier checkpoint variants). Folders with no model are skipped.
     """
     voices: list[Voice] = [_default_voice()]
 
@@ -74,14 +80,14 @@ def list_voices() -> list[Voice]:
     for sub in sorted(sound_dir.iterdir(), key=lambda p: p.name.lower()):
         if not sub.is_dir():
             continue
-        pth = _pick_pth(sub)
-        if pth is None:
+        model = _pick_model(sub)
+        if model is None:
             continue
         idx = _pick_index(sub)
         voices.append(
             Voice(
                 label=sub.name,
-                model_path=str(pth),
+                model_path=str(model),
                 index_path=str(idx) if idx else "",
                 is_default=False,
             )
