@@ -26,7 +26,11 @@ from .local_whisper_client import LocalTranscriptionWorker
 from .manager_window import ManagerWindow
 from .recorder_window import RecorderWindow
 from .respeaker_client import RespeakerWorker
-from .startup_manager import ensure_start_menu_shortcut, ensure_startup_shortcut
+from .startup_manager import (
+    ensure_start_menu_shortcut,
+    ensure_startup_shortcut,
+    refresh_taskbar_pin_icon,
+)
 from .tts_window import TtsWindow
 from .whisper_client import TranscriptionWorker
 from .youtube_audio_worker import YoutubeAudioWorker
@@ -186,6 +190,7 @@ class TrayController(QObject):
 
         ensure_startup_shortcut()
         ensure_start_menu_shortcut()
+        refresh_taskbar_pin_icon()
 
         if self._tray.supportsMessages():
             api_line = (f" · API on {self._api.bound_url}"

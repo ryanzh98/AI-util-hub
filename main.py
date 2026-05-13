@@ -36,10 +36,28 @@ sys.excepthook = _excepthook
 from dotenv import load_dotenv  # noqa: E402
 
 from PyQt6.QtCore import qInstallMessageHandler, QtMsgType  # noqa: E402
+from PyQt6.QtGui import QIcon  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon  # noqa: E402
 
+from app.paths import bundled_data_dir  # noqa: E402
 from app.tray_controller import TrayController, already_running  # noqa: E402
 from design import apply_theme  # noqa: E402
+
+
+# Windows groups taskbar entries by AppUserModelID. Without this call our
+# windows would be grouped under pythonw.exe's identity (and inherit its
+# generic Python icon), so the user sees the wrong icon in the taskbar
+# even after setWindowIcon. Must run BEFORE any window is shown.
+def _set_appusermodel_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Anthropic.VoiceDetection.Shortcut.1"
+        )
+    except (OSError, AttributeError):
+        pass
 
 
 def _qt_message(msg_type, ctx, message):
@@ -60,9 +78,19 @@ qInstallMessageHandler(_qt_message)
 def main() -> int:
     load_dotenv(BASE / ".env", override=True)
 
+    _set_appusermodel_id()
+
     app = QApplication(sys.argv)
     app.setApplicationName("VoiceDetection")
     app.setQuitOnLastWindowClosed(False)
+
+    # Set the global window icon so every top-level window (recorder, TTS,
+    # launcher, manager, etc.) shows the app icon in the taskbar / Alt-Tab.
+    # Without this each window falls back to pythonw.exe's stock icon.
+    icon_path = bundled_data_dir() / "assets" / "app_icon.ico"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+
     apply_theme(app)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
