@@ -1,10 +1,18 @@
-"""YouTube URL input window - frameless, dark, violet-accented redesign.
+"""YouTube URL input window — frameless, dark, violet-accented.
 
-Visual reference: the `.win` chrome pattern + `.ed-input` / `.btn` rules in
-`_design_handoff_temp/project/styles-windows.css` (lines 236-310). The
-validation contract (`_looks_like_youtube_url`, `_ALLOWED_HOSTS`) and the
-public signal surface are preserved 1:1 from the prior implementation -
-only the chrome changes.
+Visual reference: ``shortcut-handoff/shortcut/project/dialogs.jsx::YoutubeDialog``
+(the React blueprint shipped by design). Brand chrome reads
+"AI Util Hub · Transcribe YouTube" and uses the shared ``.win`` /
+``.win-hd`` / ``.url-body`` / ``.rec-ft`` selectors from
+``design/stylesheet.py`` so the look stays in sync with the recorder
+and TTS dialogs.
+
+Public surface (kept stable for ``tray_controller``):
+
+* ``YoutubeWindow(parent=None)`` — the QWidget class.
+* ``urlSubmitted = pyqtSignal(str)`` — emitted with a validated URL.
+* ``cancelled = pyqtSignal()`` — emitted when the user dismisses.
+* ``present()`` — show the dialog, prefill from clipboard, focus input.
 """
 
 from __future__ import annotations
@@ -30,11 +38,12 @@ from PyQt6.QtWidgets import (
 
 from design import COLOR
 from design.effects import fade_in
+from design.icons import icon, icon_size
 
 
-# Card is 520 wide (a touch more breathing room than the legacy 480).
-WINDOW_W = 520
-WINDOW_H = 200
+# 760×220 per dialogs.jsx::YoutubeDialog (single-line URL input + footer).
+WINDOW_W = 760
+WINDOW_H = 220
 OUTER_MARGIN = 0
 
 
@@ -65,10 +74,10 @@ def _looks_like_youtube_url(text: str) -> bool:
 class YoutubeWindow(QWidget):
     """Modal-ish popup that prompts for a YouTube URL.
 
-    Public surface - must stay stable for the tray controller:
+    Public surface — must stay stable for the tray controller:
 
         urlSubmitted = pyqtSignal(str)
-        cancelled = pyqtSignal()
+        cancelled    = pyqtSignal()
         def present(self) -> None
     """
 
@@ -90,20 +99,22 @@ class YoutubeWindow(QWidget):
         self._build_ui()
         self._title_bar.installEventFilter(self)
 
-    # -- construction ----------------------------------------
+    # ── construction ────────────────────────────────────────
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(OUTER_MARGIN, OUTER_MARGIN, OUTER_MARGIN, OUTER_MARGIN)
         outer.setSpacing(0)
 
+        # Card matches the .win shell from styles.css / stylesheet.py.
         self._card = QFrame(self)
         self._card.setObjectName("youtubeCard")
         self._card.setProperty("class", "win")
+        self._card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._card.setFixedSize(WINDOW_W, WINDOW_H)
         outer.addWidget(self._card, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Soft violet-tinted radial glow overlay (decorative; covers card).
+        # Soft violet-tinted radial glow overlay (decorative, ignores mouse).
         self._glow = QFrame(self._card)
         self._glow.setObjectName("youtubeGlow")
         self._glow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -117,49 +128,53 @@ class YoutubeWindow(QWidget):
         self._build_body(card_layout)
         self._build_footer(card_layout)
 
-    # -- header ----------------------------------------------
+    # ── header (.win-hd) ────────────────────────────────────
 
     def _build_header(self, parent_layout: QVBoxLayout) -> None:
         self._title_bar = QWidget(self._card)
         self._title_bar.setObjectName("youtubeHeader")
-        self._title_bar.setFixedHeight(44)
+        self._title_bar.setProperty("class", "win-hd")
+        self._title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._title_bar.setFixedHeight(48)
         self._title_bar.setCursor(Qt.CursorShape.SizeAllCursor)
 
         h = QHBoxLayout(self._title_bar)
-        h.setContentsMargins(18, 0, 12, 0)
+        h.setContentsMargins(16, 14, 12, 10)
         h.setSpacing(10)
 
-        # Brand glyph (violet rounded square with play-mark glyph).
-        brand_mark = QLabel("▶")  # right-pointing triangle
-        brand_mark.setProperty("class", "brand-mark")
-        brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        brand_mark.setFixedSize(22, 22)
-        brand_mark.setStyleSheet(
-            f"background:{COLOR.violet}; color:#FFFFFF; border-radius:6px;"
-            f"font-size:11px; font-weight:700;"
-        )
-        h.addWidget(brand_mark, alignment=Qt.AlignmentFlag.AlignVCenter)
+        # Brand glyph — violet rounded square with the rec-launcher checkmark
+        # (matches dialogs.jsx, which uses I["rec-launcher"]).
+        self._brand_mark = QLabel()
+        self._brand_mark.setProperty("class", "brand-mark sm")
+        self._brand_mark.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._brand_mark.setPixmap(icon("rec_launcher", "#FFFFFF", 12).pixmap(12, 12))
+        self._brand_mark.setFixedSize(24, 24)
+        h.addWidget(self._brand_mark, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        title_label = QLabel("Shortcut")
-        title_label.setProperty("class", "yt-title")
+        # Brand title block: "AI Util Hub · Transcribe YouTube".
+        title_label = QLabel("AI Util Hub")
+        title_label.setProperty("class", "brand-title")
         title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         h.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        dot = QLabel("·")
-        dot.setStyleSheet(f"color:{COLOR.text_3}; font-size:13px;")
-        dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        h.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+        slash = QLabel("·")
+        slash.setProperty("class", "brand-title-slash")
+        slash.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        h.addWidget(slash, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        ctx_label = QLabel("Transcribe YouTube")
-        ctx_label.setProperty("class", "yt-hint")
-        ctx_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        h.addWidget(ctx_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        sub_label = QLabel("Transcribe YouTube")
+        sub_label.setProperty("class", "brand-title-sub")
+        sub_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        h.addWidget(sub_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         h.addStretch(1)
 
-        # Close (cancel) button - small unicode glyph in a transparent icon-btn.
-        self._close_btn = QPushButton("✕")
-        self._close_btn.setProperty("class", "icon-btn")
+        # Close icon-button (.icon-btn.close).
+        self._close_btn = QPushButton()
+        self._close_btn.setProperty("class", "icon-btn close")
+        self._close_btn.setIcon(icon("close", COLOR.text_2, 18))
+        self._close_btn.setIconSize(icon_size(14))
         self._close_btn.setToolTip("Cancel and close (Esc)")
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.clicked.connect(self._on_cancel)
@@ -167,26 +182,29 @@ class YoutubeWindow(QWidget):
 
         parent_layout.addWidget(self._title_bar)
 
-    # -- body ------------------------------------------------
+    # ── body (.url-body) ────────────────────────────────────
 
     def _build_body(self, parent_layout: QVBoxLayout) -> None:
         body = QWidget(self._card)
         body.setObjectName("youtubeBody")
+        body.setProperty("class", "url-body")
+        body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
         b = QVBoxLayout(body)
-        b.setContentsMargins(18, 14, 18, 14)
+        b.setContentsMargins(18, 12, 18, 22)
         b.setSpacing(8)
 
         self._url_input = QLineEdit(body)
         self._url_input.setObjectName("youtubeUrlInput")
-        self._url_input.setProperty("class", "ed-input ed-mono")
+        self._url_input.setProperty("class", "url-input")
         self._url_input.setPlaceholderText("Paste YouTube URL…")
         self._url_input.setClearButtonEnabled(True)
-        self._url_input.setMinimumHeight(38)
+        self._url_input.setMinimumHeight(50)
         self._url_input.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._url_input.returnPressed.connect(self._on_submit)
         b.addWidget(self._url_input)
 
-        # Inline error label - leaf state, not covered by global QSS.
+        # Inline error label — leaf state, owns its own styling.
         self._error_label = QLabel("", body)
         self._error_label.setObjectName("youtubeError")
         self._error_label.setWordWrap(True)
@@ -196,38 +214,47 @@ class YoutubeWindow(QWidget):
         self._error_label.setVisible(False)
         b.addWidget(self._error_label)
 
-        b.addStretch(1)
         parent_layout.addWidget(body, 1)
 
-    # -- footer ----------------------------------------------
+    # ── footer (.rec-ft) ────────────────────────────────────
 
     def _build_footer(self, parent_layout: QVBoxLayout) -> None:
         footer = QWidget(self._card)
         footer.setObjectName("youtubeFooter")
-        footer.setFixedHeight(52)
-        f = QHBoxLayout(footer)
-        f.setContentsMargins(16, 10, 16, 10)
-        f.setSpacing(8)
+        footer.setProperty("class", "rec-ft")
+        footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        footer.setFixedHeight(60)
 
+        f = QHBoxLayout(footer)
+        f.setContentsMargins(18, 12, 18, 12)
+        f.setSpacing(10)
+
+        # Cancel — .rec-ft .left (text-only, dismisses the dialog).
         self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.setProperty("class", "btn ghost")
+        self._cancel_btn.setProperty("class", "rec-left-btn")
         self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._cancel_btn.setToolTip("Cancel (Esc)")
         self._cancel_btn.clicked.connect(self._on_cancel)
-        f.addWidget(self._cancel_btn)
+        f.addWidget(self._cancel_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        f.addStretch(1)
+        # Spacer (matches <span className="spacer" />).
+        spacer = QWidget(footer)
+        spacer.setProperty("class", "rec-ft-spacer")
+        spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        f.addWidget(spacer, 1)
 
+        # Transcribe — .btn.violet (primary action).
         self._submit_btn = QPushButton("Transcribe")
-        self._submit_btn.setProperty("class", "btn primary")
+        self._submit_btn.setProperty("class", "btn violet")
         self._submit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._submit_btn.setToolTip("Download audio and transcribe (Enter)")
+        self._submit_btn.setMinimumHeight(36)
         self._submit_btn.clicked.connect(self._on_submit)
-        f.addWidget(self._submit_btn)
+        f.addWidget(self._submit_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         parent_layout.addWidget(footer)
 
-    # -- lifecycle -------------------------------------------
+    # ── lifecycle ───────────────────────────────────────────
 
     def present(self) -> None:
         """Centre on screen, prefill from clipboard if it looks valid, focus."""
@@ -237,7 +264,7 @@ class YoutubeWindow(QWidget):
         y = geom.y() + int(geom.height() * 0.18)
         self.move(x, y)
 
-        # Clipboard auto-fill: preserved from the legacy implementation.
+        # Clipboard auto-fill — preserved from the legacy implementation.
         clip_text = (QGuiApplication.clipboard().text() or "").strip()
         if _looks_like_youtube_url(clip_text):
             self._url_input.setText(clip_text)
@@ -255,13 +282,14 @@ class YoutubeWindow(QWidget):
         # Window-level fade-in (no graphics-effect conflict with the card shadow).
         fade_in(self, duration_ms=200)
 
-    # -- handlers --------------------------------------------
+    # ── handlers ────────────────────────────────────────────
 
     def _on_submit(self) -> None:
         url = self._url_input.text().strip()
         if not _looks_like_youtube_url(url):
             self._error_label.setText(
-                "That doesn't look like a YouTube URL. Expected youtube.com or youtu.be."
+                "That doesn't look like a YouTube URL. "
+                "Expected youtube.com or youtu.be."
             )
             self._error_label.setVisible(True)
             self._url_input.setFocus()
@@ -275,7 +303,7 @@ class YoutubeWindow(QWidget):
         self.cancelled.emit()
         self.close()
 
-    # -- input -----------------------------------------------
+    # ── input ───────────────────────────────────────────────
 
     def keyPressEvent(self, event):
         key = event.key()

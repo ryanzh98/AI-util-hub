@@ -1,9 +1,13 @@
-"""Recorder window — frameless, dark, violet-accented redesign.
+"""Recorder window — Wave-3 redesign with mic-reactive waveform.
 
-Visual reference: `_design_handoff_temp/project/recorder.jsx` and the
-`.rec*` block in `styles-windows.css` (lines 469-647). The audio +
-state-machine wiring (AudioRecorder, SpeakerMute, RecorderState) is
-preserved 1:1 from the prior implementation — only the chrome changes.
+Visual reference: `shortcut-handoff/shortcut/project/recorder.jsx` and the
+`.rec*` blocks in `shortcut-handoff/shortcut/project/styles.css`. The audio
++ state-machine wiring (AudioRecorder, SpeakerMute, RecorderState) is
+preserved 1:1; the chrome is rebuilt to match the JSX (bigger card, 56-bar
+peak-meter wave, REC pill with pulsing dot, mode chip, dest pill).
+
+The waveform is now driven by `AudioRecorder.recent_levels()` via a 50ms
+QTimer (peak-meter scroll style) — no more deterministic LCG animation.
 """
 
 from __future__ import annotations
@@ -45,41 +49,51 @@ from .speaker_mute import SpeakerMute
 from .state import RecorderState
 from .voice_settings_panel import VoiceSettingsPanel
 
-# Card is 360 wide (matches `.rec`); height fits waveform + dest hint.
-WINDOW_W = 360
-WINDOW_H = 320
-WINDOW_H_RESPEAKER = 372  # extra space for voice picker row in respeaker mode
+# ── card sizing (per recorder.jsx) ──────────────────────────────────────────
+WINDOW_W = 560
+WINDOW_H = 440
+WINDOW_H_RESPEAKER = 540
 WINDOW_H_RESPEAKER_PANEL_COLLAPSED = WINDOW_H_RESPEAKER + 36
-WINDOW_H_RESPEAKER_PANEL_EXPANDED = WINDOW_H_RESPEAKER + VoiceSettingsPanel.EXPANDED_HEIGHT + 10
+WINDOW_H_RESPEAKER_PANEL_EXPANDED = (
+    WINDOW_H_RESPEAKER + VoiceSettingsPanel.EXPANDED_HEIGHT + 10
+)
 OUTER_MARGIN = 0
 
-# Waveform geometry — 44 bars at 3px wide with 3px gaps, ~44px tall.
-BAR_COUNT = 44
+# ── waveform geometry — 56 bars, peak-meter style ──────────────────────────
+BAR_COUNT = 56
 BAR_WIDTH = 3
-BAR_GAP = 3
-WAVE_HEIGHT = 44
+BAR_GAP = 2
+WAVE_HEIGHT = 56
+
+# Visual response curve for the mic levels.
+_WAVE_GAIN = 6.0       # multiplier — typical speech RMS sits around 0.05..0.2
+_WAVE_GAMMA = 0.7      # < 1 boosts mid/low energy so soft speech is visible
+_WAVE_FLOOR_PX = 4     # baseline so silent moments still show a sliver
 
 
 class _WaveBar(QFrame):
     """Single waveform bar with an animatable `barHeight` int property.
 
-    The height is driven by a QPropertyAnimation; QSS handles the violet
-    gradient fill (see `recorder_qss()` `.rec-bar`).
+    QSS handles the violet gradient fill (see `recorder_qss()` `.rec-bar`
+    + `.rec-wave .bar` selectors). Heights are pushed in by the
+    `_refresh_wave` peak-meter loop.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setProperty("class", "rec-bar")
+        # Tag with both legacy `rec-bar` and Wave-3 `bar` (under .rec-wave) so
+        # either stylesheet selector matches.
+        self.setProperty("class", "rec-bar bar")
         self.setFixedWidth(BAR_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._bar_height = 6
+        self._bar_height = _WAVE_FLOOR_PX
         self.setFixedHeight(self._bar_height)
 
     def get_bar_height(self) -> int:
         return self._bar_height
 
     def set_bar_height(self, value: int) -> None:
-        v = max(2, int(value))
+        v = max(_WAVE_FLOOR_PX, int(value))
         if v == self._bar_height:
             return
         self._bar_height = v
@@ -93,10 +107,17 @@ class RecorderWindow(QWidget):
 
     Public surface — must stay stable for the tray controller:
 
-        recordingStopped = pyqtSignal(bytes)
+        recordingStopped  = pyqtSignal(bytes)
         recordingCancelled = pyqtSignal()
+        voiceChanged      = pyqtSignal(str, str, str)
+        voiceSettingsChanged = pyqtSignal(dict)
+        replayRequested   = pyqtSignal(str)
         def present(self, mode: str = "online") -> None
         def shutdown(self) -> None
+        def set_voice_by_model_path(self, path) -> None
+        def current_voice(self) -> tuple[str, str, str]
+        def set_voice_settings(self, settings) -> None
+        def set_done(self, wav_path: str) -> None
     """
 
     recordingStopped = pyqtSignal(bytes)
@@ -130,9 +151,12 @@ class RecorderWindow(QWidget):
         self._tick_timer.setInterval(50)
         self._tick_timer.timeout.connect(self._on_tick)
 
-        # Per-bar animations; populated in _build_wave.
-        self._bar_anims: list[QPropertyAnimation] = []
+        # Bars (populated in _build_wave). The mic-reactive peak-meter loop
+        # pushes heights into these via _refresh_wave on a 50ms cadence.
         self._bars: list[_WaveBar] = []
+        self._level_timer = QTimer(self)
+        self._level_timer.setInterval(50)
+        self._level_timer.timeout.connect(self._refresh_wave)
 
         self._build_ui()
         self._wire_animations()
@@ -165,63 +189,67 @@ class RecorderWindow(QWidget):
         self._build_body(card_layout)
         self._build_footer(card_layout)
 
-    # ── header ───────────────────────────────────────────────
+    # ── header (.win-hd) ─────────────────────────────────────
 
     def _build_header(self, parent_layout: QVBoxLayout) -> None:
         self._title_bar = QWidget(self._card)
         self._title_bar.setObjectName("recorderHead")
-        self._title_bar.setFixedHeight(40)
+        self._title_bar.setFixedHeight(48)
         self._title_bar.setCursor(Qt.CursorShape.SizeAllCursor)
 
         h = QHBoxLayout(self._title_bar)
-        h.setContentsMargins(18, 14, 14, 0)
+        h.setContentsMargins(16, 14, 16, 10)
         h.setSpacing(10)
 
-        # Brand glyph (violet rounded square with mic-ish sparkle stand-in).
-        brand_mark = QLabel("✦")
-        brand_mark.setProperty("class", "brand-mark")
-        brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        brand_mark.setFixedSize(18, 18)
-        brand_mark.setStyleSheet(
-            f"background:{COLOR.violet}; color:#FFFFFF; border-radius:5px;"
-            f"font-size:10px; font-weight:700;"
+        # Brand-mark.sm — 24x24 violet→violet_2 gradient pill with check glyph.
+        self._brand_mark = QLabel()
+        self._brand_mark.setProperty("class", "brand-mark sm")
+        self._brand_mark.setFixedSize(24, 24)
+        self._brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._brand_mark.setStyleSheet(
+            f"QLabel{{background: qlineargradient("
+            f"x1:0, y1:0, x2:1, y2:1, stop:0 {COLOR.violet}, stop:1 {COLOR.violet_2});"
+            f" border-radius: 7px; color: #FFFFFF;}}"
         )
-        h.addWidget(brand_mark, alignment=Qt.AlignmentFlag.AlignVCenter)
+        # Use rec_launcher (checkmark) glyph as the default brand mark, per JSX.
+        self._brand_mark.setPixmap(icon("rec_launcher", "#FFFFFF", 12).pixmap(12, 12))
+        h.addWidget(self._brand_mark, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        title_label = QLabel("Voice → Clipboard")
-        title_label.setProperty("class", "rec-title")
-        title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        h.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self._title_label = QLabel("Voice → Clipboard")
+        self._title_label.setProperty("class", "brand-title rec-title")
+        self._title_label.setStyleSheet(
+            f"QLabel{{color:{COLOR.text_1}; font-size:13.5px;"
+            f" font-weight:{FONT.w_semibold}; letter-spacing:-0.005em;}}"
+        )
+        self._title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        h.addWidget(self._title_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         h.addStretch(1)
 
-        # REC / PAUSED pill with pulsing dot.
-        self._live_pill = QWidget(self._title_bar)
-        self._live_pill.setProperty("class", "rec-live-wrap")
-        pill_h = QHBoxLayout(self._live_pill)
-        pill_h.setContentsMargins(7, 2, 6, 2)
-        pill_h.setSpacing(5)
-        self._live_pill.setStyleSheet(
-            f"QWidget[class~=\"rec-live-wrap\"]{{background:{COLOR.danger_soft};"
-            f"border-radius:4px;}}"
-        )
+        # REC / PAUSED badge with pulsing dot (Wave-3 .rec-badge).
+        self._rec_badge = QFrame(self._title_bar)
+        self._rec_badge.setProperty("class", "rec-badge")
+        badge_h = QHBoxLayout(self._rec_badge)
+        badge_h.setContentsMargins(11, 6, 11, 6)
+        badge_h.setSpacing(8)
 
-        self._pulse_dot = QLabel()
-        self._pulse_dot.setProperty("class", "rec-pulse-dot")
-        self._pulse_dot.setFixedSize(6, 6)
-        pill_h.addWidget(self._pulse_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self._pulse_dot = QFrame(self._rec_badge)
+        self._pulse_dot.setProperty("class", "rec-badge-pulse")
+        self._pulse_dot.setFixedSize(7, 7)
+        badge_h.addWidget(self._pulse_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._live_label = QLabel("REC")
-        self._live_label.setProperty("class", "rec-live")
-        pill_h.addWidget(self._live_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self._live_label.setProperty("class", "rec-badge-lbl")
+        badge_h.addWidget(self._live_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        h.addWidget(self._live_pill, alignment=Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(self._rec_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         # Close (cancel) button.
         self._close_btn = QPushButton()
-        self._close_btn.setProperty("class", "icon-btn")
-        self._close_btn.setIcon(icon("close", COLOR.text_2, 18))
+        self._close_btn.setProperty("class", "icon-btn close")
+        self._close_btn.setIcon(icon("close", COLOR.text_2, 14))
         self._close_btn.setIconSize(icon_size(14))
+        self._close_btn.setFixedSize(26, 26)
         self._close_btn.setToolTip("Cancel and close")
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.clicked.connect(self._on_cancel)
@@ -229,29 +257,39 @@ class RecorderWindow(QWidget):
 
         parent_layout.addWidget(self._title_bar)
 
-    # ── body ─────────────────────────────────────────────────
+    # ── body (.rec-body) ─────────────────────────────────────
 
     def _build_body(self, parent_layout: QVBoxLayout) -> None:
         body = QWidget(self._card)
         body.setObjectName("recorderBody")
         b = QVBoxLayout(body)
-        b.setContentsMargins(22, 6, 22, 12)
-        b.setSpacing(0)
+        b.setContentsMargins(28, 10, 28, 24)
+        b.setSpacing(22)
         b.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
         # ── timer row (mm:ss + .ms suffix) ──────────────────
         timer_row = QWidget(body)
         tr = QHBoxLayout(timer_row)
-        tr.setContentsMargins(0, 4, 0, 0)
-        tr.setSpacing(6)
+        tr.setContentsMargins(0, 10, 0, 0)
+        tr.setSpacing(0)
         tr.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._timer_label = QLabel("00:00")
-        self._timer_label.setProperty("class", "rec-timer")
-        tr.addWidget(self._timer_label, alignment=Qt.AlignmentFlag.AlignBottom)
+        self._timer_mm = QLabel("00")
+        self._timer_mm.setProperty("class", "rec-timer")
+        tr.addWidget(self._timer_mm, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self._timer_colon = QLabel(":")
+        self._timer_colon.setProperty("class", "rec-timer")
+        self._timer_colon.setStyleSheet("QLabel{margin-left:14px; margin-right:14px;}")
+        tr.addWidget(self._timer_colon, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self._timer_ss = QLabel("00")
+        self._timer_ss.setProperty("class", "rec-timer")
+        tr.addWidget(self._timer_ss, alignment=Qt.AlignmentFlag.AlignBottom)
 
         self._timer_ms_label = QLabel(".00")
         self._timer_ms_label.setProperty("class", "rec-timer-ms")
+        self._timer_ms_label.setStyleSheet("QLabel{margin-left:6px;}")
         tr.addWidget(self._timer_ms_label, alignment=Qt.AlignmentFlag.AlignBottom)
 
         b.addWidget(timer_row)
@@ -259,109 +297,118 @@ class RecorderWindow(QWidget):
         # ── waveform ────────────────────────────────────────
         self._build_wave(b)
 
-        # ── mode chip + locale ──────────────────────────────
-        mode_row = QWidget(body)
+        # ── mode chip + locale (.rec-row) ───────────────────
+        mode_row = QFrame(body)
+        mode_row.setProperty("class", "rec-row")
         mr = QHBoxLayout(mode_row)
-        mr.setContentsMargins(0, 4, 0, 0)
-        mr.setSpacing(8)
+        mr.setContentsMargins(0, 0, 0, 0)
+        mr.setSpacing(14)
         mr.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._mode_chip = QFrame(mode_row)
         self._mode_chip.setProperty("class", "rec-chip")
         chip_h = QHBoxLayout(self._mode_chip)
-        chip_h.setContentsMargins(0, 0, 0, 0)
-        chip_h.setSpacing(6)
+        chip_h.setContentsMargins(14, 8, 14, 8)
+        chip_h.setSpacing(8)
 
         self._mode_icon = QLabel()
-        self._mode_icon.setPixmap(icon("mic", COLOR.violet, 11).pixmap(11, 11))
-        self._mode_icon.setFixedSize(11, 11)
+        self._mode_icon.setProperty("class", "rec-chip-ic")
+        self._mode_icon.setFixedSize(14, 14)
+        self._mode_icon.setPixmap(icon("mic_solid", COLOR.violet, 14).pixmap(14, 14))
         chip_h.addWidget(self._mode_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._mode_label = QLabel("Online STT · Whisper")
+        self._mode_label.setStyleSheet(
+            f"QLabel{{color:{COLOR.text_1}; font-size:12.5px;"
+            f" font-weight:{FONT.w_medium};}}"
+        )
         chip_h.addWidget(self._mode_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         mr.addWidget(self._mode_chip)
 
         self._locale_label = QLabel("en-US")
-        self._locale_label.setStyleSheet(
-            f"color:{COLOR.text_4}; font-size:11px;"
-        )
+        self._locale_label.setProperty("class", "rec-row-lang")
         mr.addWidget(self._locale_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        b.addWidget(mode_row)
+        b.addWidget(mode_row, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # ── voice picker (respeaker mode only; hidden otherwise) ─
-        self._voice_row = QWidget(body)
+        # ── voice picker (clone-only; .field-row + .field-input) ─
+        self._voice_row = QFrame(body)
         self._voice_row.setObjectName("recorderVoiceRow")
+        self._voice_row.setProperty("class", "field-row")
         vr = QHBoxLayout(self._voice_row)
-        vr.setContentsMargins(0, 8, 0, 0)
-        vr.setSpacing(8)
-        vr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vr.setContentsMargins(0, 0, 0, 0)
+        vr.setSpacing(14)
+        vr.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         voice_label = QLabel("Voice")
-        voice_label.setStyleSheet(f"color:{COLOR.text_3}; font-size:11px;")
+        voice_label.setProperty("class", "field-row-lbl")
+        voice_label.setFixedWidth(50)
         vr.addWidget(voice_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._voice_combo = QComboBox(self._voice_row)
+        self._voice_combo.setProperty("class", "field-input")
         self._voice_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._voice_combo.setMinimumWidth(220)
+        self._voice_combo.setMinimumHeight(38)
+        self._voice_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        # Inline a compact look so the QComboBox roughly matches .field-input
+        # (the global stylesheet targets QFrame/QWidget/QLineEdit, not QComboBox).
         self._voice_combo.setStyleSheet(
             f"QComboBox{{background:{COLOR.surface_2}; color:{COLOR.text_1};"
-            f" border:1px solid {COLOR.line}; border-radius:6px;"
-            f" padding:3px 8px; font-size:11px; min-height:20px;}}"
-            f"QComboBox:hover{{border-color:{COLOR.violet};}}"
-            f"QComboBox::drop-down{{border:none; width:18px;}}"
+            f" border:1px solid {COLOR.line_strong}; border-radius:10px;"
+            f" padding:6px 12px; font-size:13px; min-height:26px;}}"
+            f"QComboBox:hover{{border-color:{COLOR.line_3};}}"
+            f"QComboBox:focus{{border-color:{COLOR.violet_line};}}"
+            f"QComboBox::drop-down{{border:none; width:22px;}}"
             f"QComboBox QAbstractItemView{{background:{COLOR.surface_2};"
             f" color:{COLOR.text_1}; selection-background-color:{COLOR.violet};"
-            f" border:1px solid {COLOR.line};}}"
+            f" border:1px solid {COLOR.line_strong};}}"
         )
         self._voices = voice_catalog.list_voices()
         for v in self._voices:
             display = v.label if v.available else f"{v.label} (missing)"
             self._voice_combo.addItem(display)
         self._voice_combo.currentIndexChanged.connect(self._on_voice_index_changed)
-        vr.addWidget(self._voice_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
+        vr.addWidget(self._voice_combo, 1, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._voice_row.setVisible(False)
         b.addWidget(self._voice_row)
 
-        # ── advanced TTS+RVC settings (respeaker mode only) ─
+        # ── advanced TTS+RVC settings (clone only) ────────────
+        # The panel ships its own internal disclosure toggle, so we just embed
+        # it; expandedChanged drives our card resize.
         self._settings_panel = VoiceSettingsPanel(body)
         self._settings_panel.setVisible(False)
         self._settings_panel.settingsChanged.connect(self.voiceSettingsChanged.emit)
         self._settings_panel.expandedChanged.connect(self._on_settings_expanded)
         b.addWidget(self._settings_panel)
 
-        # ── destination hint ────────────────────────────────
+        # ── destination pill (.rec-dest) ────────────────────
         self._dest = QFrame(body)
         self._dest.setProperty("class", "rec-dest")
         d = QHBoxLayout(self._dest)
-        d.setContentsMargins(12, 8, 12, 8)
-        d.setSpacing(8)
-        d.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        d.setContentsMargins(16, 12, 16, 12)
+        d.setSpacing(10)
+        d.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        clip_icon = QLabel("📋")
-        clip_icon.setStyleSheet("font-size:12px;")
-        clip_icon.setFixedSize(14, 14)
+        clip_icon = QLabel()
+        clip_icon.setFixedSize(16, 16)
+        clip_icon.setPixmap(icon("transcript", COLOR.violet, 16).pixmap(16, 16))
         d.addWidget(clip_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         dest_text = QLabel("Transcript will land on your")
-        dest_text.setStyleSheet(f"color:{COLOR.text_2}; font-size:11px;")
+        dest_text.setStyleSheet(f"color:{COLOR.text_2}; font-size:12.5px;")
         d.addWidget(dest_text, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        dest_target = QLabel("clipboard")
-        dest_target.setProperty("class", "rec-dest-target")
-        dest_target.setStyleSheet(
-            f"color:{COLOR.text_1}; font-size:11px; font-weight:{FONT.w_medium};"
-        )
-        d.addWidget(dest_target, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self._dest_target = QLabel("clipboard")
+        self._dest_target.setProperty("class", "rec-dest-target")
+        d.addWidget(self._dest_target, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # Holder so we can centre the dest pill and give it the full body width.
-        dest_holder = QWidget(body)
-        dh = QHBoxLayout(dest_holder)
-        dh.setContentsMargins(0, 12, 0, 0)
-        dh.addWidget(self._dest, 1)
-        b.addWidget(dest_holder)
+        d.addStretch(1)
+
+        b.addWidget(self._dest)
 
         # ── config warning (hidden unless needed) ───────────
         self._warning = QLabel(
@@ -370,7 +417,7 @@ class RecorderWindow(QWidget):
         self._warning.setObjectName("recorderWarning")
         self._warning.setWordWrap(True)
         self._warning.setStyleSheet(
-            f"color:{COLOR.danger}; font-size:11px; padding-top:6px;"
+            f"color:{COLOR.amber}; font-size:11px; padding-top:6px;"
         )
         self._warning.setVisible(False)
         b.addWidget(self._warning)
@@ -379,64 +426,42 @@ class RecorderWindow(QWidget):
         parent_layout.addWidget(body, 1)
 
     def _build_wave(self, body_layout: QVBoxLayout) -> None:
-        """Build 44 violet bars with deterministic per-bar height animations."""
-        wave = QWidget()
-        wave.setObjectName("recorderWave")
-        wave.setFixedHeight(WAVE_HEIGHT)
-        wave.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        wl = QHBoxLayout(wave)
-        wl.setContentsMargins(0, 0, 0, 0)
+        """Build 56 violet bars driven by the mic-reactive peak-meter loop."""
+        self._wave_widget = QFrame()
+        self._wave_widget.setObjectName("recorderWave")
+        self._wave_widget.setProperty("class", "rec-wave")
+        self._wave_widget.setFixedHeight(WAVE_HEIGHT)
+        self._wave_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._wave_widget.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        wl = QHBoxLayout(self._wave_widget)
+        wl.setContentsMargins(4, 0, 4, 0)
         wl.setSpacing(BAR_GAP)
         wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Stable pseudo-random seeded bars — mirrors the JSX LCG (seed=7,
-        # constants 9301 / 49297 / 233280) so the visual is reproducible.
-        s = 7
         for _ in range(BAR_COUNT):
-            s = (s * 9301 + 49297) % 233280
-            r = s / 233280.0
-            lo_pct = 6 + int(r * 14)            # 6..20
-            hi_pct = 30 + int(r * 70)           # 30..100
-            lo = max(2, int(WAVE_HEIGHT * lo_pct / 100))
-            hi = max(lo + 4, int(WAVE_HEIGHT * hi_pct / 100))
-            dur_ms = int((0.7 + r * 0.9) * 1000)
-            delay_pct = (len(self._bars) * 0.04) % 1.0
-
             bar = _WaveBar()
-            bar.set_bar_height(lo)
+            bar.set_bar_height(_WAVE_FLOOR_PX)
             self._bars.append(bar)
             wl.addWidget(bar, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-            anim = QPropertyAnimation(bar, QByteArray(b"barHeight"), self)
-            anim.setDuration(dur_ms)
-            anim.setLoopCount(-1)
-            anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-            anim.setKeyValueAt(0.0, lo)
-            anim.setKeyValueAt(0.5, hi)
-            anim.setKeyValueAt(1.0, lo)
-            # Offset start by shifting current-time within the loop so bars
-            # don't all peak simultaneously.
-            anim._start_offset_ms = int(delay_pct * dur_ms)  # cached for restart
-            self._bar_anims.append(anim)
+        body_layout.addWidget(self._wave_widget)
 
-        wave_holder = QWidget()
-        wh = QHBoxLayout(wave_holder)
-        wh.setContentsMargins(0, 14, 0, 4)
-        wh.addStretch(1)
-        wh.addWidget(wave)
-        wh.addStretch(1)
-        body_layout.addWidget(wave_holder)
-
-    # ── footer ───────────────────────────────────────────────
+    # ── footer (.rec-ft) ─────────────────────────────────────
 
     def _build_footer(self, parent_layout: QVBoxLayout) -> None:
-        footer = QWidget(self._card)
+        footer = QFrame(self._card)
         footer.setObjectName("recorderFooter")
-        footer.setFixedHeight(60)
+        footer.setProperty("class", "rec-ft")
+        footer.setFixedHeight(64)
         f = QHBoxLayout(footer)
-        f.setContentsMargins(16, 14, 16, 16)
-        f.setSpacing(8)
+        f.setContentsMargins(18, 14, 18, 14)
+        f.setSpacing(10)
 
+        # Cancel — left ghost button.
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setProperty("class", "rec-left-btn")
         self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -446,59 +471,51 @@ class RecorderWindow(QWidget):
 
         f.addStretch(1)
 
+        # Pause / Resume — neutral .btn.
         self._pause_btn = QPushButton("  Pause")
-        self._pause_btn.setProperty("class", "rec-btn pause")
-        self._pause_btn.setIcon(icon("pause", COLOR.text_1, 13))
-        self._pause_btn.setIconSize(icon_size(13))
+        self._pause_btn.setProperty("class", "btn")
+        self._pause_btn.setIcon(icon("pause", COLOR.text_1, 14))
+        self._pause_btn.setIconSize(icon_size(14))
         self._pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._pause_btn.setToolTip("Pause / Resume (Space)")
         self._pause_btn.clicked.connect(self._on_toggle_pause)
         f.addWidget(self._pause_btn)
 
+        # Stop & Transcribe — coral CTA (.btn.coral).
         self._stop_btn = QPushButton("  Stop & Transcribe")
-        self._stop_btn.setProperty("class", "rec-btn stop")
-        self._stop_btn.setIcon(icon("stop", "#0C0D15", 13))
-        self._stop_btn.setIconSize(icon_size(13))
+        self._stop_btn.setProperty("class", "btn coral")
+        self._stop_btn.setIcon(icon("stop", "#1A0608", 14))
+        self._stop_btn.setIconSize(icon_size(14))
         self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._stop_btn.setToolTip("Stop and transcribe (Enter)")
         self._stop_btn.clicked.connect(self._on_stop)
         f.addWidget(self._stop_btn)
 
-        # DONE-state buttons — appear after the cloned voice has played in
-        # respeaker mode. Sized + styled like the rec-btn family but ghosted
-        # so they don't compete with the primary action.
-        done_btn_qss = (
-            f"QPushButton{{background:{COLOR.surface_3}; color:{COLOR.text_1};"
-            f" border:1px solid {COLOR.line}; border-radius:8px;"
-            f" padding:5px 12px; font-size:11px;}}"
-            f"QPushButton:hover{{border-color:{COLOR.violet};"
-            f" color:{COLOR.violet};}}"
-            f"QPushButton:disabled{{color:{COLOR.text_4};}}"
-        )
-
-        self._replay_btn = QPushButton("▶ Replay")
-        self._replay_btn.setProperty("class", "rec-btn replay")
+        # ── DONE-state buttons (respeaker-only post-playback) ──
+        self._replay_btn = QPushButton("  Replay")
+        self._replay_btn.setProperty("class", "btn")
+        self._replay_btn.setIcon(icon("play", COLOR.text_1, 14))
+        self._replay_btn.setIconSize(icon_size(14))
         self._replay_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._replay_btn.setToolTip("Replay the cloned voice")
-        self._replay_btn.setStyleSheet(done_btn_qss)
         self._replay_btn.clicked.connect(self._on_replay)
         self._replay_btn.setVisible(False)
         f.insertWidget(1, self._replay_btn)  # right after Cancel
 
-        self._save_btn = QPushButton("💾 Save audio")
-        self._save_btn.setProperty("class", "rec-btn save")
+        self._save_btn = QPushButton("  Save audio")
+        self._save_btn.setProperty("class", "btn")
+        self._save_btn.setIcon(icon("save", COLOR.text_1, 14))
+        self._save_btn.setIconSize(icon_size(14))
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_btn.setToolTip("Save the cloned voice WAV to another location")
-        self._save_btn.setStyleSheet(done_btn_qss)
         self._save_btn.clicked.connect(self._on_save_audio)
         self._save_btn.setVisible(False)
-        f.insertWidget(2, self._save_btn)  # after Replay
+        f.insertWidget(2, self._save_btn)
 
         self._done_close_btn = QPushButton("Close")
-        self._done_close_btn.setProperty("class", "rec-btn close")
+        self._done_close_btn.setProperty("class", "btn")
         self._done_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._done_close_btn.setToolTip("Close (Esc)")
-        self._done_close_btn.setStyleSheet(done_btn_qss)
         self._done_close_btn.clicked.connect(lambda: self.close())
         self._done_close_btn.setVisible(False)
         f.addWidget(self._done_close_btn)
@@ -517,26 +534,48 @@ class RecorderWindow(QWidget):
         self._entry_anim.setEndValue(1.0)
         self._entry_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
+    # ── mic-reactive peak-meter ──────────────────────────────
+
+    def _refresh_wave(self) -> None:
+        """Pull the latest 56 RMS samples and push them into the bars.
+
+        Called every 50ms by `_level_timer`. The recorder pushes a 0.0
+        whenever the input is paused, so leaving the timer running during
+        PAUSED gives a natural decay-to-floor effect.
+        """
+        levels = self._recorder.recent_levels(BAR_COUNT)
+        usable = WAVE_HEIGHT - _WAVE_FLOOR_PX
+        for bar, lvl in zip(self._bars, levels):
+            scaled = min(1.0, lvl * _WAVE_GAIN)
+            shaped = scaled ** _WAVE_GAMMA if scaled > 0 else 0.0
+            h = _WAVE_FLOOR_PX + int(usable * shaped)
+            bar.set_bar_height(max(_WAVE_FLOOR_PX, min(WAVE_HEIGHT, h)))
+
     def _start_wave(self) -> None:
-        for anim in self._bar_anims:
-            if anim.state() != QPropertyAnimation.State.Running:
-                anim.start()
-                anim.setCurrentTime(getattr(anim, "_start_offset_ms", 0))
-            else:
-                anim.setPaused(False)
+        """Start the peak-meter loop and clear any 'paused' visual state."""
+        self._wave_widget.setProperty("class", "rec-wave")
+        self._wave_widget.style().unpolish(self._wave_widget)
+        self._wave_widget.style().polish(self._wave_widget)
+        if not self._level_timer.isActive():
+            self._level_timer.start()
 
     def _pause_wave(self) -> None:
-        for anim in self._bar_anims:
-            if anim.state() == QPropertyAnimation.State.Running:
-                anim.setPaused(True)
+        """Mark wave as paused but keep the timer running.
+
+        AudioRecorder pushes 0.0 frames while paused, so the bars decay to
+        the floor naturally as the deque rolls forward.
+        """
+        self._wave_widget.setProperty("class", "rec-wave paused")
+        self._wave_widget.style().unpolish(self._wave_widget)
+        self._wave_widget.style().polish(self._wave_widget)
 
     def _stop_wave(self, freeze_low: bool = True) -> None:
-        for anim, bar in zip(self._bar_anims, self._bars):
-            anim.stop()
-            if freeze_low:
-                lo = anim.keyValueAt(0.0)
-                if isinstance(lo, int):
-                    bar.set_bar_height(lo)
+        """Stop the peak-meter loop entirely (TRANSCRIBING / DONE / IDLE)."""
+        if self._level_timer.isActive():
+            self._level_timer.stop()
+        if freeze_low:
+            for bar in self._bars:
+                bar.set_bar_height(_WAVE_FLOOR_PX)
 
     # ── lifecycle ────────────────────────────────────────────
 
@@ -575,17 +614,40 @@ class RecorderWindow(QWidget):
         self._resize_for_mode()
 
         if is_respeaker:
+            self._title_label.setText("Voice → Cloned voice")
+            self._brand_mark.setPixmap(
+                icon("head_voice", "#FFFFFF", 12).pixmap(12, 12)
+            )
             self._mode_label.setText("Offline STT → voice clone")
+            self._mode_icon.setPixmap(
+                icon("mic_outline", COLOR.violet, 14).pixmap(14, 14)
+            )
             self._warning.setVisible(False)
             self._stop_btn.setEnabled(True)
-            self._stop_btn.setToolTip("Stop, transcribe locally, then speak in cloned voice (Enter)")
+            self._stop_btn.setToolTip(
+                "Stop, transcribe locally, then speak in cloned voice (Enter)"
+            )
         elif mode == "offline":
+            self._title_label.setText("Voice → Clipboard")
+            self._brand_mark.setPixmap(
+                icon("rec_launcher", "#FFFFFF", 12).pixmap(12, 12)
+            )
             self._mode_label.setText("Offline STT · faster-whisper")
+            self._mode_icon.setPixmap(
+                icon("mic_outline", COLOR.violet, 14).pixmap(14, 14)
+            )
             self._warning.setVisible(False)
             self._stop_btn.setEnabled(True)
             self._stop_btn.setToolTip("Stop and transcribe locally (Enter)")
         else:
+            self._title_label.setText("Voice → Clipboard")
+            self._brand_mark.setPixmap(
+                icon("rec_launcher", "#FFFFFF", 12).pixmap(12, 12)
+            )
             self._mode_label.setText("Online STT · Whisper")
+            self._mode_icon.setPixmap(
+                icon("mic_solid", COLOR.violet, 14).pixmap(14, 14)
+            )
             raw = os.environ.get("OPENAI_API_KEY", "").strip()
             api_key_set = bool(raw) and raw != "sk-replace-me"
             self._warning.setVisible(not api_key_set)
@@ -685,27 +747,30 @@ class RecorderWindow(QWidget):
         self._state = new_state
         if new_state == RecorderState.RECORDING:
             self._live_label.setText("REC")
+            self._set_badge_paused(False)
             self._start_wave()
             self._pause_btn.setText("  Pause")
-            self._pause_btn.setIcon(icon("pause", COLOR.text_1, 13))
+            self._pause_btn.setIcon(icon("pause", COLOR.text_1, 14))
             self._pause_btn.setEnabled(True)
         elif new_state == RecorderState.PAUSED:
             self._live_label.setText("PAUSED")
+            self._set_badge_paused(True)
             self._pause_wave()
             self._pause_btn.setText("  Resume")
-            self._pause_btn.setIcon(icon("play", COLOR.text_1, 13))
+            self._pause_btn.setIcon(icon("play", COLOR.text_1, 14))
             self._pause_btn.setEnabled(True)
         elif new_state == RecorderState.TRANSCRIBING:
             self._live_label.setText("…")
-            self._pause_wave()
+            self._set_badge_paused(True)
+            self._stop_wave(freeze_low=True)
             self._pause_btn.setEnabled(False)
             self._stop_btn.setEnabled(False)
             self._cancel_btn.setEnabled(False)
         elif new_state == RecorderState.DONE:
-            # Respeaker post-playback: swap the action buttons. The live
-            # pill becomes "DONE"; the wave is frozen low to signal "no
-            # active recording".
+            # Respeaker post-playback: swap the action buttons. The badge
+            # becomes "DONE" (paused styling); the wave is frozen low.
             self._live_label.setText("DONE")
+            self._set_badge_paused(True)
             self._stop_wave(freeze_low=True)
             self._cancel_btn.setVisible(False)
             self._pause_btn.setVisible(False)
@@ -717,7 +782,16 @@ class RecorderWindow(QWidget):
             self._save_btn.setEnabled(bool(self._last_wav))
         elif new_state == RecorderState.IDLE:
             self._live_label.setText("REC")
+            self._set_badge_paused(False)
             self._stop_wave(freeze_low=True)
+
+    def _set_badge_paused(self, paused: bool) -> None:
+        """Toggle the .paused modifier on the REC badge so QSS picks up the
+        muted styling."""
+        cls = "rec-badge paused" if paused else "rec-badge"
+        self._rec_badge.setProperty("class", cls)
+        self._rec_badge.style().unpolish(self._rec_badge)
+        self._rec_badge.style().polish(self._rec_badge)
 
     # ── handlers ─────────────────────────────────────────────
 
@@ -730,7 +804,8 @@ class RecorderWindow(QWidget):
         total_sec = self._elapsed_ms // 1000
         m, s = divmod(total_sec, 60)
         cs = (self._elapsed_ms % 1000) // 10  # centiseconds (2 digits)
-        self._timer_label.setText(f"{m:02d}:{s:02d}")
+        self._timer_mm.setText(f"{m:02d}")
+        self._timer_ss.setText(f"{s:02d}")
         self._timer_ms_label.setText(f".{cs:02d}")
 
     def _on_toggle_pause(self) -> None:
@@ -849,5 +924,3 @@ class RecorderWindow(QWidget):
             if et == QEvent.Type.MouseButtonRelease:
                 self._drag_pos = None
         return super().eventFilter(obj, event)
-
-

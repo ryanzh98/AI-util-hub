@@ -12,32 +12,36 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Color:
     # Surfaces
-    bg: str = "#0A0B0F"
-    surface_1: str = "#14151B"
-    surface_2: str = "#1B1D26"
-    surface_3: str = "#23262F"
-    surface_4: str = "#2A2D38"
+    bg: str = "#000000"
+    surface_1: str = "#0B0B10"  # window outer (CSS --surf-0)
+    surface_2: str = "#14141C"  # window inner (CSS --surf-1)
+    surface_3: str = "#1A1A24"  # card / input  (CSS --surf-2)
+    surface_4: str = "#22222E"  # card hover    (CSS --surf-3)
+    surface_5: str = "#2A2A38"  # divider strong (CSS --surf-4)
 
     # Lines
     line: str = "rgba(255,255,255,0.06)"
     line_strong: str = "rgba(255,255,255,0.10)"
+    line_3: str = "rgba(255,255,255,0.16)"
     line_soft: str = "rgba(255,255,255,0.04)"
 
     # Text
-    text_1: str = "#EEEFF2"
-    text_2: str = "#9B9EA9"
-    text_3: str = "#6A6D78"
-    text_4: str = "#4A4D58"
+    text_1: str = "#F4F4F8"
+    text_2: str = "#9C9CA8"
+    text_3: str = "#66666F"
+    text_4: str = "#44444C"
+    text_mute: str = "#2E2E36"
 
     # Violet accent
     violet: str = "#8B7FFF"
+    violet_2: str = "#6E63E6"  # gradient endpoint
     violet_soft: str = "rgba(139,127,255,0.14)"
-    violet_line: str = "rgba(139,127,255,0.40)"
-    violet_glow: str = "rgba(139,127,255,0.30)"
+    violet_line: str = "rgba(139,127,255,0.45)"
+    violet_glow: str = "rgba(139,127,255,0.35)"
 
     # Mint accent
     mint: str = "#5EE0B8"
-    mint_soft: str = "rgba(94,224,184,0.12)"
+    mint_soft: str = "rgba(94,224,184,0.14)"
     mint_line: str = "rgba(94,224,184,0.35)"
     mint_glow: str = "rgba(94,224,184,0.28)"
 
@@ -45,9 +49,14 @@ class Color:
     amber: str = "#F5B847"
     amber_soft: str = "rgba(245,184,71,0.12)"
 
-    # Danger
+    # Danger / Coral (handoff renamed danger -> coral; both names exposed)
     danger: str = "#FF6B7A"
-    danger_soft: str = "rgba(255,107,122,0.12)"
+    danger_soft: str = "rgba(255,107,122,0.20)"
+    coral: str = "#FF6B7A"
+    coral_2: str = "#FF8593"
+    coral_soft: str = "rgba(255,107,122,0.20)"
+    coral_line: str = "rgba(255,107,122,0.55)"
+    coral_glow: str = "rgba(255,107,122,0.40)"
 
     # URL accent
     url_blue: str = "#82B0FF"
@@ -55,7 +64,8 @@ class Color:
 
 @dataclass(frozen=True)
 class Radius:
-    sm: int = 6
+    xs: int = 5
+    sm: int = 7
     md: int = 10
     lg: int = 14
     xl: int = 18
@@ -73,7 +83,7 @@ class Font:
     size_md: int = 13
     size_lg: int = 16
     size_xl: int = 18
-    size_timer: int = 44
+    size_timer: int = 64
 
     # Weights
     w_regular: int = 400

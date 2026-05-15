@@ -1,10 +1,31 @@
-"""Frameless dashboard window for managing the unified library of actions."""
+"""Frameless dashboard window for managing the unified library of actions.
+
+Wave-3 redesign — two-pane layout per
+``shortcut-handoff/shortcut/project/manager.jsx``:
+
+  · Left rail (280px): search box, segmented tabs (All / System / AI /
+    Snippets), grouped scrollable list of items.
+  · Right pane: branches by item kind —
+        - System / Launcher / Snippet  → :class:`SystemEditor`
+          (read-only header + hotkey-only footer).
+        - AI Action                    → :class:`AIActionEditor`
+          (prompt textarea + model select + temperature + behavior).
+
+Public surface preserved (HARD requirement — wired by tray_controller):
+
+    class ManagerWindow(config: Config, config_path: Path, parent=None)
+        configChanged = pyqtSignal(object)        # emits new Config
+        closeRequested = pyqtSignal()
+        set_config(config: Config)                # external refresh
+        present()                                  # show + center on cursor
+        hide()                                     # inherited from QWidget
+"""
 
 from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from PyQt6.QtCore import (
     QEvent,
@@ -15,7 +36,6 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QCursor, QGuiApplication
 from PyQt6.QtWidgets import (
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -24,7 +44,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -34,23 +53,21 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from design import COLOR, FONT
+from design import COLOR, FONT, RADIUS
+from design.icons import icon, icon_size
 
 from .actions_config import Config, Item, new_item_id, save_config
 from .hotkey_recorder import HotkeyRecorderButton
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    pass
-
 
 # ---------------------------------------------------------------------------
-# Layout constants
+# Layout constants (handoff: 1000 × 660 outer card, 280 px left rail)
 # ---------------------------------------------------------------------------
 
-CARD_WIDTH = 880
-CARD_HEIGHT = 580
+CARD_WIDTH = 1000
+CARD_HEIGHT = 660
 OUTER_PADDING = 0
-RAIL_WIDTH = 264
+RAIL_WIDTH = 280
 
 LAUNCHER_PSEUDO_ID = "__launcher__"
 
@@ -62,6 +79,31 @@ AI_MODEL_CHOICES: list[tuple[str, str]] = [
     ("openai/gpt-5-mini", "openai/gpt-5-mini"),
     ("google/gemini-2.5-pro", "google/gemini-2.5-pro"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Item.subtype → SVG icon name (mirrors the launcher's mapping).
+# ---------------------------------------------------------------------------
+
+_SUBTYPE_ICON = {
+    "voice_online":     "mic_solid",
+    "voice_offline":    "mic_outline",
+    "grammar":          "spark",
+    "youtube":          "youtube",
+    "voice_respeaker":  "head_voice",
+    "voice_tts":        "type_voice",
+}
+
+
+def _icon_for_item(item: Item) -> str:
+    """Return the registered SVG icon name for *item*."""
+    if item.subtype and item.subtype in _SUBTYPE_ICON:
+        return _SUBTYPE_ICON[item.subtype]
+    if item.type == "ai":
+        return "id_card"
+    if item.type == "snippet":
+        return "clipboard"
+    return "spark"
 
 
 # ---------------------------------------------------------------------------
@@ -77,71 +119,110 @@ def _repolish(w: QWidget) -> None:
     w.update()
 
 
-def _set_class(w: QWidget, klass: str) -> None:
-    w.setProperty("class", klass)
-    _repolish(w)
+def _make_icon_label(name: str, color: str, size: int,
+                     parent: Optional[QWidget] = None) -> QLabel:
+    """Create a transparent QLabel rendering the named SVG icon at *size*."""
+    lbl = QLabel(parent)
+    lbl.setPixmap(icon(name, color, size).pixmap(icon_size(size)))
+    lbl.setFixedSize(size, size)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    return lbl
 
 
-def _section_for(item: Item) -> str:
-    if item.type == "system":
-        return "system"
-    if item.type == "ai":
-        return "ai"
-    return "snippet"
+def _make_kbd_lg(text: str, parent: Optional[QWidget] = None) -> QLabel:
+    """Render a single ``.kbd.lg`` chip (used in the hotkey-row footer)."""
+    lbl = QLabel(text, parent)
+    lbl.setProperty("class", "kbd lg")
+    lbl.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return lbl
+
+
+def _humanize_chord(chord: str) -> list[str]:
+    """``'<ctrl>+<alt>+1'`` → ``['Ctrl', 'Alt', '1']`` for chip rendering."""
+    if not chord:
+        return []
+    out: list[str] = []
+    for raw in chord.split("+"):
+        tok = raw.strip().strip("<>")
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in ("ctrl", "alt", "shift", "win", "meta", "cmd"):
+            out.append(tok[:1].upper() + tok[1:].lower())
+        elif len(tok) == 1:
+            out.append(tok.upper())
+        else:
+            out.append(tok.title())
+    return out
+
+
+def _format_hotkey_chip(chord: str) -> str:
+    """Compact trailing-key chip for the rail rows (e.g. ``'1'``, ``'F5'``)."""
+    if not chord:
+        return ""
+    try:
+        tail = chord.split("+")[-1].strip()
+    except Exception:
+        return ""
+    if tail.startswith("<") and tail.endswith(">"):
+        tail = tail[1:-1]
+    return tail.upper()[:4]
 
 
 # ---------------------------------------------------------------------------
-# Row widget (left rail list item)
+# Library row (left rail list item)
 # ---------------------------------------------------------------------------
 
 class LibraryRow(QPushButton):
+    """One row in the left rail. Clicking selects the item."""
+
     rowClicked = pyqtSignal(str)
 
-    def __init__(self, item_id: str, emoji: str, name: str, hotkey_chip: str,
-                 type_glyph: str, parent: Optional[QWidget] = None):
+    def __init__(self, item_id: str, icon_name: str, name: str,
+                 hotkey_chip: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._item_id = item_id
         self.setProperty("class", "mgr-row")
         self.setProperty("on", "false")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setMinimumHeight(34)
+        self.setMinimumHeight(36)
         self.setText("")  # children render the row
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(8, 6, 8, 6)
+        row.setContentsMargins(8, 4, 8, 4)
         row.setSpacing(10)
 
-        grip = QLabel("⋮⋮")
+        grip = QLabel("⠇⠇")  # decorative double-grip
         grip.setProperty("class", "mgr-grip")
         grip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         row.addWidget(grip)
 
-        emoji_lbl = QLabel(emoji or "")
-        emoji_lbl.setStyleSheet("font-size: 15px;")
-        emoji_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        row.addWidget(emoji_lbl)
+        self._icon_lbl = _make_icon_label(icon_name, COLOR.violet, 16, self)
+        self._icon_lbl.setProperty("class", "mgr-row-icon")
+        row.addWidget(self._icon_lbl)
 
-        name_lbl = QLabel(name or "")
+        name_lbl = QLabel(name or "(unnamed)")
         name_lbl.setProperty("class", "mgr-row-name")
         name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        name_lbl.setStyleSheet(f"color: {COLOR.text_1};")
         row.addWidget(name_lbl, 1)
 
         self._chip = QLabel(hotkey_chip)
-        self._chip.setProperty("class", "kbd")
+        self._chip.setProperty("class", "mgr-row-num")
+        self._chip.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         if not hotkey_chip:
             self._chip.setVisible(False)
         row.addWidget(self._chip)
 
-        glyph = QLabel(type_glyph)
-        glyph.setProperty("class", "mgr-row-meta")
-        glyph.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        glyph.setStyleSheet(f"color: {COLOR.text_4};")
-        row.addWidget(glyph)
+        spark = _make_icon_label("spark", COLOR.violet_soft, 12, self)
+        spark.setProperty("class", "mgr-row-spark")
+        row.addWidget(spark)
 
         self.clicked.connect(self._on_click)
 
@@ -158,26 +239,29 @@ class LibraryRow(QPushButton):
 
 
 # ---------------------------------------------------------------------------
-# Editor base
+# Editor base — header + footer scaffold shared by both editors.
 # ---------------------------------------------------------------------------
 
 class _EditorBase(QWidget):
-    """Common scaffold for all three editor variants."""
+    """Common scaffold: optional warning banner + body slot + hotkey footer."""
 
+    # Signals — superset across both editor variants. Each editor only emits
+    # the ones relevant to its kind. ManagerWindow wires every signal even on
+    # editors that never fire it; that's harmless.
     nameChanged = pyqtSignal(str, str)        # (item_id, new_name)
-    emojiChanged = pyqtSignal(str, str)       # (item_id, new_emoji)
+    emojiChanged = pyqtSignal(str, str)       # (item_id, new_emoji) — unused now
     enabledChanged = pyqtSignal(str, bool)
     hotkeyChanged = pyqtSignal(str, str)      # (item_id, new_hotkey)
     deleteRequested = pyqtSignal(str)
     duplicateRequested = pyqtSignal(str)
-    # AI-specific
     promptChanged = pyqtSignal(str, str)
     modelChanged = pyqtSignal(str, str)
     temperatureChanged = pyqtSignal(str, float)
-    # Snippet-specific
     bodyChanged = pyqtSignal(str, str)
     kindChanged = pyqtSignal(str, str)
     behaviorChanged = pyqtSignal(str, str)
+
+    saveClicked = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -187,68 +271,7 @@ class _EditorBase(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # --- header
-        self._header = QWidget(self)
-        self._header.setObjectName("managerEditHead")
-        self._header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        head = QHBoxLayout(self._header)
-        head.setContentsMargins(22, 16, 22, 14)
-        head.setSpacing(14)
-
-        self._emoji_box = QLabel("")
-        self._emoji_box.setProperty("class", "ed-hd-emoji")
-        self._emoji_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._emoji_box.setFixedSize(48, 48)
-        head.addWidget(self._emoji_box, 0, Qt.AlignmentFlag.AlignTop)
-
-        meta_col = QVBoxLayout()
-        meta_col.setContentsMargins(0, 0, 0, 0)
-        meta_col.setSpacing(4)
-
-        self._kind_lbl = QLabel("")
-        self._kind_lbl.setProperty("class", "ed-hd-kind")
-        meta_col.addWidget(self._kind_lbl)
-
-        self._name_edit = QLineEdit()
-        self._name_edit.setProperty("class", "ed-hd-name")
-        self._name_edit.setPlaceholderText("Name…")
-        self._name_edit.textEdited.connect(self._on_name_edited)
-        meta_col.addWidget(self._name_edit)
-
-        self._sub_lbl = QLabel("")
-        self._sub_lbl.setProperty("class", "ed-hd-sub")
-        self._sub_lbl.setWordWrap(True)
-        self._sub_lbl.setStyleSheet(f"color: {COLOR.text_2};")
-        meta_col.addWidget(self._sub_lbl)
-
-        head.addLayout(meta_col, 1)
-
-        actions_col = QHBoxLayout()
-        actions_col.setContentsMargins(0, 0, 0, 0)
-        actions_col.setSpacing(8)
-
-        self._change_emoji_btn = QPushButton("Change emoji")
-        self._change_emoji_btn.setProperty("class", "btn ghost")
-        self._change_emoji_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._change_emoji_btn.clicked.connect(self._on_change_emoji)
-        actions_col.addWidget(self._change_emoji_btn)
-
-        self._duplicate_btn = QPushButton("Duplicate")
-        self._duplicate_btn.setProperty("class", "btn ghost")
-        self._duplicate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._duplicate_btn.clicked.connect(self._on_duplicate)
-        actions_col.addWidget(self._duplicate_btn)
-
-        self._delete_btn = QPushButton("Delete")
-        self._delete_btn.setProperty("class", "btn ghost danger")
-        self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._delete_btn.clicked.connect(self._on_delete)
-        actions_col.addWidget(self._delete_btn)
-
-        head.addLayout(actions_col)
-        root.addWidget(self._header)
-
-        # --- duplicate-hotkey warning banner
+        # --- duplicate-hotkey warning banner (hidden when empty)
         self._warn_banner = QFrame(self)
         self._warn_banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._warn_banner.setStyleSheet(
@@ -256,7 +279,7 @@ class _EditorBase(QWidget):
             "border-bottom: 1px solid rgba(255,107,122,0.30);"
         )
         warn_lyt = QHBoxLayout(self._warn_banner)
-        warn_lyt.setContentsMargins(22, 8, 22, 8)
+        warn_lyt.setContentsMargins(24, 8, 24, 8)
         warn_lyt.setSpacing(8)
         self._warn_label = QLabel("")
         self._warn_label.setStyleSheet(f"color: {COLOR.danger}; font-size: 12px;")
@@ -265,54 +288,69 @@ class _EditorBase(QWidget):
         self._warn_banner.hide()
         root.addWidget(self._warn_banner)
 
-        # --- body (subclasses populate)
-        self._body_scroll = QScrollArea(self)
-        self._body_scroll.setWidgetResizable(True)
-        self._body_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._body_scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
-
-        self._body = QWidget()
-        self._body.setStyleSheet(f"background: {COLOR.surface_1};")
-        self._body_layout = QVBoxLayout(self._body)
-        self._body_layout.setContentsMargins(22, 16, 22, 18)
+        # --- body host (subclasses populate via _build_body())
+        self._body_host = QWidget(self)
+        self._body_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._body_layout = QVBoxLayout(self._body_host)
+        self._body_layout.setContentsMargins(24, 22, 24, 22)
         self._body_layout.setSpacing(18)
-        self._body_scroll.setWidget(self._body)
-        root.addWidget(self._body_scroll, 1)
+        root.addWidget(self._body_host, 1)
 
-        # --- footer (hotkey + save)
-        self._footer = QWidget(self)
-        self._footer.setObjectName("editorFooter")
+        # --- footer: hotkey-row + Save (.ed-ft)
+        self._footer = QFrame(self)
+        self._footer.setProperty("class", "ed-ft")
         self._footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         ft = QHBoxLayout(self._footer)
-        ft.setContentsMargins(22, 11, 22, 11)
+        ft.setContentsMargins(20, 12, 20, 12)
         ft.setSpacing(10)
 
-        ft_lbl = QLabel("Hotkey")
-        ft_lbl.setProperty("class", "ed-ft-lbl")
-        ft.addWidget(ft_lbl)
+        # Hotkey row container (.hotkey-row): label + chips + Clear button.
+        # The chips are rendered/maintained by HotkeyRecorderButton; we just
+        # group it next to the static label so everything reads as one row.
+        hk_row = QFrame(self._footer)
+        hk_row.setProperty("class", "hotkey-row")
+        hk_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        hk_lyt = QHBoxLayout(hk_row)
+        hk_lyt.setContentsMargins(0, 0, 0, 0)
+        hk_lyt.setSpacing(8)
 
-        self._hotkey_btn = HotkeyRecorderButton("", self._footer)
+        hk_lbl = QLabel("Hotkey")
+        hk_lbl.setProperty("class", "hotkey-row-lbl")
+        hk_lyt.addWidget(hk_lbl)
+
+        self._hotkey_btn = HotkeyRecorderButton("", hk_row)
         self._hotkey_btn.captured.connect(self._on_hotkey_captured)
         self._hotkey_btn.cleared.connect(self._on_hotkey_cleared)
-        ft.addWidget(self._hotkey_btn)
+        hk_lyt.addWidget(self._hotkey_btn)
 
+        ft.addWidget(hk_row)
         ft.addStretch(1)
 
-        self._save_btn = QPushButton("\U0001F4BE  Save")
-        self._save_btn.setProperty("class", "btn primary")
+        # Violet Save button with leading save glyph.
+        self._save_btn = QPushButton(self._footer)
+        self._save_btn.setProperty("class", "btn violet")
+        self._save_btn.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._save_btn.setText("  Save")
+        self._save_btn.setIcon(icon("save", "#14101A", 14))
+        self._save_btn.setIconSize(icon_size(14))
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_btn.setMinimumHeight(34)
+        self._save_btn.setStyleSheet(
+            "QPushButton[class~=\"btn\"][class~=\"violet\"] {"
+            f"  border-radius: {RADIUS.md}px; padding: 6px 16px;"
+            "}"
+        )
         self._save_btn.clicked.connect(self._on_save_clicked)
         ft.addWidget(self._save_btn)
 
         root.addWidget(self._footer)
 
-        # Save-flash timer
+        # Save-flash timer ("Saved ✓" → restore after 1.5 s).
         self._save_flash_timer = QTimer(self)
         self._save_flash_timer.setSingleShot(True)
         self._save_flash_timer.timeout.connect(self._restore_save_label)
 
-    # Public surface ----------------------------------------------------
+    # -- public surface ------------------------------------------------
 
     def current_id(self) -> Optional[str]:
         return self._current_id
@@ -326,53 +364,16 @@ class _EditorBase(QWidget):
             self._warn_banner.show()
 
     def trigger_save_flash(self) -> None:
-        self._save_btn.setText("Saved ✓")
+        self._save_btn.setText("  Saved ✓")
         self._save_flash_timer.start(1500)
 
-    def saveRequested(self):  # noqa: N802 (Qt-style accessor name kept lowercase)
-        return self._save_signal
-
-    # Signals via subclass overrides (we use a Qt signal proxy below)
-    saveClicked = pyqtSignal()
-
-    # Internal --------------------------------------------------------
+    # -- internal ------------------------------------------------------
 
     def _restore_save_label(self) -> None:
-        self._save_btn.setText("\U0001F4BE  Save")
+        self._save_btn.setText("  Save")
 
     def _on_save_clicked(self) -> None:
         self.saveClicked.emit()
-
-    def _on_name_edited(self, text: str) -> None:
-        if self._current_id is None:
-            return
-        self.nameChanged.emit(self._current_id, text)
-
-    def _on_change_emoji(self) -> None:
-        if self._current_id is None:
-            return
-        current = self._emoji_box.text() or ""
-        new, ok = QInputDialog.getText(
-            self, "Change emoji", "Emoji or character:", QLineEdit.EchoMode.Normal, current
-        )
-        if not ok:
-            return
-        new = (new or "").strip()
-        if not new:
-            return
-        # Accept just the first grapheme-ish chunk; user is trusted.
-        self._emoji_box.setText(new)
-        self.emojiChanged.emit(self._current_id, new)
-
-    def _on_duplicate(self) -> None:
-        if self._current_id is None:
-            return
-        self.duplicateRequested.emit(self._current_id)
-
-    def _on_delete(self) -> None:
-        if self._current_id is None:
-            return
-        self.deleteRequested.emit(self._current_id)
 
     def _on_hotkey_captured(self, value: str) -> None:
         if self._current_id is None:
@@ -384,280 +385,383 @@ class _EditorBase(QWidget):
             return
         self.hotkeyChanged.emit(self._current_id, "")
 
-    # Subclass hooks ---------------------------------------------------
-
-    def _clear_body(self) -> None:
-        while self._body_layout.count():
-            child = self._body_layout.takeAt(0)
-            w = child.widget()
-            if w is not None:
-                w.deleteLater()
-            else:
-                lyt = child.layout()
-                if lyt is not None:
-                    self._discard_layout(lyt)
-
-    def _discard_layout(self, lyt) -> None:
-        while lyt.count():
-            child = lyt.takeAt(0)
-            w = child.widget()
-            if w is not None:
-                w.deleteLater()
-            else:
-                sub = child.layout()
-                if sub is not None:
-                    self._discard_layout(sub)
-
 
 # ---------------------------------------------------------------------------
-# Small field helper
-# ---------------------------------------------------------------------------
-
-def _make_field(label: str, control: QWidget, hint: Optional[str] = None) -> QWidget:
-    wrap = QWidget()
-    lyt = QVBoxLayout(wrap)
-    lyt.setContentsMargins(0, 0, 0, 0)
-    lyt.setSpacing(7)
-    lbl = QLabel(label)
-    lbl.setProperty("class", "ed-field-lbl")
-    lyt.addWidget(lbl)
-    lyt.addWidget(control)
-    if hint:
-        h = QLabel(hint)
-        h.setProperty("class", "ed-field-hint")
-        h.setWordWrap(True)
-        lyt.addWidget(h)
-    return wrap
-
-
-# ---------------------------------------------------------------------------
-# System editor
+# System / Launcher / Snippet editor
 # ---------------------------------------------------------------------------
 
 class SystemEditor(_EditorBase):
+    """Read-only meta header + explanation paragraph + hotkey-only footer.
+
+    Used for ``Item.type == 'system'``, the synthetic launcher pseudo-item,
+    and (per the Wave-3 spec) snippets — for which only the hotkey is
+    user-tunable from this window.
+    """
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self._name_edit.setReadOnly(True)
-        self._change_emoji_btn.hide()
-        self._duplicate_btn.hide()
-        self._delete_btn.hide()
         self._build_body()
 
     def _build_body(self) -> None:
-        self._clear_body()
+        # --- .ed-meta header row: 44px violet icon block + kind/h2/p stack
+        self._meta_row = QFrame(self._body_host)
+        self._meta_row.setProperty("class", "ed-meta")
+        self._meta_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        meta_lyt = QHBoxLayout(self._meta_row)
+        meta_lyt.setContentsMargins(0, 0, 0, 0)
+        meta_lyt.setSpacing(14)
 
-        self._enabled_chk = QCheckBox("Enabled in popup launcher")
-        self._enabled_chk.setProperty("class", "ed-check")
-        self._enabled_chk.stateChanged.connect(self._on_enabled_changed)
+        self._meta_ic = QLabel(self._meta_row)
+        self._meta_ic.setProperty("class", "ed-meta-ic")
+        self._meta_ic.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._meta_ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        meta_lyt.addWidget(self._meta_ic, 0, Qt.AlignmentFlag.AlignTop)
 
-        self._body_layout.addWidget(_make_field(
-            "Status",
-            self._enabled_chk,
-            "Disable to hide this built-in feature from the popup tile grid. "
-            "Its global hotkey will also be unbound.",
-        ))
+        meta_col = QVBoxLayout()
+        meta_col.setContentsMargins(0, 0, 0, 0)
+        meta_col.setSpacing(4)
+
+        self._kind_lbl = QLabel("")
+        self._kind_lbl.setProperty("class", "ed-meta-kind")
+        meta_col.addWidget(self._kind_lbl)
+
+        self._name_lbl = QLabel("")
+        self._name_lbl.setProperty("class", "ed-meta-h2")
+        meta_col.addWidget(self._name_lbl)
+
+        self._sub_lbl = QLabel("")
+        self._sub_lbl.setProperty("class", "ed-meta-p")
+        self._sub_lbl.setWordWrap(True)
+        meta_col.addWidget(self._sub_lbl)
+
+        meta_lyt.addLayout(meta_col, 1)
+        self._body_layout.addWidget(self._meta_row)
+
+        # --- .ed-body / .ed-explain paragraph
+        self._explain_lbl = QLabel("")
+        self._explain_lbl.setProperty("class", "ed-explain")
+        self._explain_lbl.setWordWrap(True)
+        self._body_layout.addWidget(self._explain_lbl)
+
         self._body_layout.addStretch(1)
 
-    def populate(self, item: Item) -> None:
-        self._current_id = item.id
-        self._emoji_box.setText(item.emoji or "")
-        self._kind_lbl.setText("●  SYSTEM FEATURE")
-        self._kind_lbl.setStyleSheet(f"color: {COLOR.text_3};")
-        self._name_edit.setText(item.name or "")
-        self._sub_lbl.setText(
-            "Built-in feature. Trigger it from any window with the hotkey below, "
-            "or click its tile in the launcher popup."
+    # -- public --------------------------------------------------------
+
+    def populate_launcher(self, hotkey: str) -> None:
+        self._current_id = LAUNCHER_PSEUDO_ID
+        self._render_meta_icon("rec_launcher")
+        self._kind_lbl.setText("LAUNCHER")
+        self._name_lbl.setText("Launcher (open popup)")
+        self._sub_lbl.setText("Global trigger — works from any window.")
+        self._explain_lbl.setText(
+            "This is the global hotkey that opens the launcher popup from "
+            "anywhere. Pick a chord with at least one of Ctrl, Alt, Shift, "
+            "or Win."
         )
-        self._enabled_chk.blockSignals(True)
-        self._enabled_chk.setChecked(bool(item.enabled))
-        self._enabled_chk.blockSignals(False)
+        self._hotkey_btn.setValue(hotkey or "")
+
+    def populate_system(self, item: Item) -> None:
+        self._current_id = item.id
+        self._render_meta_icon(_icon_for_item(item))
+        self._kind_lbl.setText("SYSTEM ACTION")
+        self._name_lbl.setText(item.name or "")
+        self._sub_lbl.setText(
+            "Built-in system action. Hotkey is the only thing you can edit."
+        )
+        bound = bool(item.hotkey)
+        self._explain_lbl.setText(
+            "Built-in system actions can't be edited — only their "
+            "quick-fire chord. The launcher hotkey opens the popup and "
+            + ("this chord runs it directly."
+               if bound else "no chord is currently bound to run it directly.")
+        )
         self._hotkey_btn.setValue(item.hotkey or "")
 
-    def _on_enabled_changed(self, state: int) -> None:
-        if self._current_id is None:
-            return
-        self.enabledChanged.emit(self._current_id, state == Qt.CheckState.Checked.value)
+    def populate_snippet(self, item: Item) -> None:
+        """Snippets share the system editor variant (per Wave-3 spec)."""
+        self._current_id = item.id
+        self._render_meta_icon(_icon_for_item(item))
+        is_url = (item.kind or "text").lower() == "url"
+        self._kind_lbl.setText("URL SNIPPET" if is_url else "TEXT SNIPPET")
+        self._name_lbl.setText(item.name or "")
+        if is_url:
+            self._sub_lbl.setText(
+                "Opens the URL in your default browser when fired."
+            )
+            self._explain_lbl.setText(
+                "URL snippets open in your default browser. Edit the URL "
+                "directly in clipboard_actions.json; only the hotkey is "
+                "tunable from this window."
+            )
+        else:
+            self._sub_lbl.setText(
+                "Replaces the clipboard with this text. Paste with Ctrl+V."
+            )
+            self._explain_lbl.setText(
+                "Text snippets are sent straight to the clipboard. Edit the "
+                "body in clipboard_actions.json; only the hotkey is tunable "
+                "from this window."
+            )
+        self._hotkey_btn.setValue(item.hotkey or "")
+
+    # -- internal ------------------------------------------------------
+
+    def _render_meta_icon(self, name: str) -> None:
+        self._meta_ic.setPixmap(icon(name, COLOR.violet, 22).pixmap(icon_size(22)))
 
 
 # ---------------------------------------------------------------------------
-# AI editor
+# AI Action editor — full form (prompt, model, temperature, behavior)
 # ---------------------------------------------------------------------------
 
-class AIEditor(_EditorBase):
+class AIActionEditor(_EditorBase):
+    """Full editor for ``Item.type == 'ai'`` rows."""
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._build_body()
 
     def _build_body(self) -> None:
-        self._clear_body()
+        # --- .ai-ed-hd header row: 56px icon, meta column, action buttons
+        self._hd_row = QFrame(self._body_host)
+        self._hd_row.setProperty("class", "ai-ed-hd")
+        self._hd_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        hd_lyt = QHBoxLayout(self._hd_row)
+        hd_lyt.setContentsMargins(0, 0, 0, 0)
+        hd_lyt.setSpacing(16)
 
-        cols = QHBoxLayout()
-        cols.setContentsMargins(0, 0, 0, 0)
-        cols.setSpacing(22)
+        self._hd_ic = QLabel(self._hd_row)
+        self._hd_ic.setProperty("class", "ai-ed-hd-ic")
+        self._hd_ic.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._hd_ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hd_lyt.addWidget(self._hd_ic, 0, Qt.AlignmentFlag.AlignTop)
 
-        # Left column: prompt + preview
+        meta_col = QFrame(self._hd_row)
+        meta_col.setProperty("class", "ai-ed-hd-meta")
+        meta_col.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        mc_lyt = QVBoxLayout(meta_col)
+        mc_lyt.setContentsMargins(0, 0, 0, 0)
+        mc_lyt.setSpacing(4)
+
+        self._kind_lbl = QLabel("AI ACTION")
+        self._kind_lbl.setProperty("class", "ai-ed-hd-kind")
+        mc_lyt.addWidget(self._kind_lbl)
+
+        # Editable name. The plain-class is fine here; size is governed by
+        # font metrics in the surrounding .ai-ed-hd-h2 selector. Keep the
+        # field chromeless to match the JSX h2 visual.
+        self._name_edit = QLineEdit(meta_col)
+        self._name_edit.setPlaceholderText("Name…")
+        self._name_edit.setStyleSheet(
+            "QLineEdit {"
+            "  background: transparent; border: 0;"
+            f"  font-size: 22px; font-weight: {FONT.w_semibold};"
+            f"  color: {COLOR.text_1}; padding: 2px 0;"
+            "}"
+        )
+        self._name_edit.textEdited.connect(self._on_name_edited)
+        mc_lyt.addWidget(self._name_edit)
+
+        self._sub_lbl = QLabel(
+            "Runs against your clipboard contents and replaces them with the result."
+        )
+        self._sub_lbl.setProperty("class", "ai-ed-hd-p")
+        self._sub_lbl.setWordWrap(True)
+        mc_lyt.addWidget(self._sub_lbl)
+
+        hd_lyt.addWidget(meta_col, 1)
+
+        # Action buttons (.ai-ed-actions): Change emoji / Duplicate / Delete
+        self._actions_col = QFrame(self._hd_row)
+        self._actions_col.setProperty("class", "ai-ed-actions")
+        self._actions_col.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        ac_lyt = QHBoxLayout(self._actions_col)
+        ac_lyt.setContentsMargins(0, 0, 0, 0)
+        ac_lyt.setSpacing(4)
+
+        self._change_emoji_btn = QPushButton("Change emoji", self._actions_col)
+        self._change_emoji_btn.setProperty("class", "ai-ed-action")
+        self._change_emoji_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._change_emoji_btn.clicked.connect(self._on_change_emoji)
+        ac_lyt.addWidget(self._change_emoji_btn)
+
+        self._duplicate_btn = QPushButton("Duplicate", self._actions_col)
+        self._duplicate_btn.setProperty("class", "ai-ed-action")
+        self._duplicate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._duplicate_btn.clicked.connect(self._on_duplicate)
+        ac_lyt.addWidget(self._duplicate_btn)
+
+        self._delete_btn = QPushButton("Delete", self._actions_col)
+        self._delete_btn.setProperty("class", "ai-ed-action danger")
+        self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._delete_btn.clicked.connect(self._on_delete)
+        ac_lyt.addWidget(self._delete_btn)
+
+        hd_lyt.addWidget(self._actions_col, 0, Qt.AlignmentFlag.AlignTop)
+
+        self._body_layout.addWidget(self._hd_row)
+
+        # --- .ai-ed-cols 2-col grid (left flex / right 280)
+        cols_wrap = QFrame(self._body_host)
+        cols_wrap.setProperty("class", "ai-ed-cols")
+        cols_wrap.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        cols_lyt = QHBoxLayout(cols_wrap)
+        cols_lyt.setContentsMargins(0, 0, 0, 0)
+        cols_lyt.setSpacing(20)
+
+        # -- left column: PROMPT label + textarea + hint
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(18)
+        left.setSpacing(8)
+
+        prompt_lbl = QLabel("PROMPT")
+        prompt_lbl.setProperty("class", "ed-field-lbl")
+        left.addWidget(prompt_lbl)
 
         self._prompt_edit = QTextEdit()
-        self._prompt_edit.setProperty("class", "ed-textarea ed-prompt")
-        self._prompt_edit.setMinimumHeight(140)
-        self._prompt_edit.textChanged.connect(self._on_prompt_changed)
-        left.addWidget(_make_field(
-            "Prompt",
-            self._prompt_edit,
-            "Sent as the system prompt. The clipboard contents are sent as the user message.",
-        ))
-
-        # Static preview block (visual nicety, not live)
-        preview_frame = QFrame()
-        preview_frame.setProperty("class", "ed-preview")
-        preview_frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        pl = QVBoxLayout(preview_frame)
-        pl.setContentsMargins(14, 12, 14, 14)
-        pl.setSpacing(10)
-
-        plh = QHBoxLayout()
-        plh.setContentsMargins(0, 0, 0, 0)
-        plh.setSpacing(8)
-        dot = QLabel()
-        dot.setFixedSize(6, 6)
-        dot.setStyleSheet(
-            f"background: {COLOR.violet}; border-radius: 3px;"
+        self._prompt_edit.setProperty("class", "ai-prompt")
+        self._prompt_edit.setMinimumHeight(220)
+        self._prompt_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        plh.addWidget(dot)
-        plbl = QLabel("LIVE PREVIEW")
-        plbl.setProperty("class", "ed-preview-lbl")
-        plh.addWidget(plbl)
-        plh.addStretch(1)
-        pmute = QLabel("sample input, not a live LLM call")
-        pmute.setProperty("class", "ed-preview-mute")
-        plh.addWidget(pmute)
-        pl.addLayout(plh)
+        self._prompt_edit.textChanged.connect(self._on_prompt_changed)
+        left.addWidget(self._prompt_edit, 1)
 
-        grid = QHBoxLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(8)
+        prompt_hint = QLabel(
+            "Sent as the system prompt. The clipboard contents are sent as "
+            "the user message."
+        )
+        prompt_hint.setProperty("class", "ed-field-hint")
+        prompt_hint.setWordWrap(True)
+        left.addWidget(prompt_hint)
 
-        def _cell(header: str, text: str) -> QFrame:
-            cell = QFrame()
-            cell.setProperty("class", "ed-preview-cell")
-            cell.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            cly = QVBoxLayout(cell)
-            cly.setContentsMargins(10, 10, 12, 12)
-            cly.setSpacing(6)
-            h = QLabel(header)
-            h.setProperty("class", "ed-preview-hdcell")
-            cly.addWidget(h)
-            t = QLabel(text)
-            t.setProperty("class", "ed-preview-text")
-            t.setWordWrap(True)
-            cly.addWidget(t)
-            return cell
-
-        grid.addWidget(_cell(
-            "CLIPBOARD INPUT",
-            "heyy can u send me that doc when u get a sec, thx",
-        ), 1)
-        arrow = QLabel("→")
-        arrow.setProperty("class", "ed-preview-arrow")
-        arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        arrow.setFixedWidth(32)
-        grid.addWidget(arrow)
-        grid.addWidget(_cell(
-            "RESULT",
-            "Hi — could you send that document over when you have a moment? Thanks.",
-        ), 1)
-
-        pl.addLayout(grid)
-        left.addWidget(preview_frame)
-        left.addStretch(1)
-
-        left_wrap = QWidget()
+        left_wrap = QWidget(cols_wrap)
         left_wrap.setLayout(left)
-        cols.addWidget(left_wrap, 1)
+        cols_lyt.addWidget(left_wrap, 1)
 
-        # Right column: model, temperature, enabled
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(18)
+        # -- right column: .ai-side stack (Model / Temperature / Behavior)
+        side = QFrame(cols_wrap)
+        side.setProperty("class", "ai-side")
+        side.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        side.setFixedWidth(280)
+        side_lyt = QVBoxLayout(side)
+        side_lyt.setContentsMargins(0, 0, 0, 0)
+        side_lyt.setSpacing(20)
 
-        self._model_combo = QComboBox()
-        self._model_combo.setProperty("class", "ed-input")
+        # MODEL
+        model_block = QVBoxLayout()
+        model_block.setContentsMargins(0, 0, 0, 0)
+        model_block.setSpacing(8)
+        model_lbl = QLabel("MODEL")
+        model_lbl.setProperty("class", "ed-field-lbl")
+        model_block.addWidget(model_lbl)
+
+        self._model_combo = QComboBox(side)
+        self._model_combo.setProperty("class", "select-field")
         self._model_combo.setEditable(True)
         for value, label in AI_MODEL_CHOICES:
             self._model_combo.addItem(label, value)
         self._model_combo.currentIndexChanged.connect(self._on_model_changed)
-        self._model_combo.lineEdit().editingFinished.connect(self._on_model_text_finished)
-        right.addWidget(_make_field(
-            "Model",
-            self._model_combo,
-            "Any OpenRouter model id. Leave blank for the grammar fallback default.",
-        ))
+        line_edit = self._model_combo.lineEdit()
+        if line_edit is not None:
+            line_edit.editingFinished.connect(self._on_model_text_finished)
+        model_block.addWidget(self._model_combo)
 
-        temp_wrap = QWidget()
-        temp_lyt = QVBoxLayout(temp_wrap)
-        temp_lyt.setContentsMargins(0, 0, 0, 0)
-        temp_lyt.setSpacing(6)
-        self._temp_slider = QSlider(Qt.Orientation.Horizontal)
-        self._temp_slider.setProperty("class", "ed-slider")
+        model_hint = QLabel(
+            "Any OpenRouter model id. Leave blank for the grammar fallback default."
+        )
+        model_hint.setProperty("class", "ed-field-hint")
+        model_hint.setWordWrap(True)
+        model_block.addWidget(model_hint)
+        side_lyt.addLayout(model_block)
+
+        # TEMPERATURE — .temp-row label + .range slider + .range-marks + hint
+        temp_block = QVBoxLayout()
+        temp_block.setContentsMargins(0, 0, 0, 0)
+        temp_block.setSpacing(6)
+
+        temp_row = QFrame(side)
+        temp_row.setProperty("class", "temp-row")
+        temp_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        tr_lyt = QHBoxLayout(temp_row)
+        tr_lyt.setContentsMargins(0, 0, 0, 0)
+        tr_lyt.setSpacing(6)
+        self._temp_lbl = QLabel("Temperature")
+        self._temp_lbl.setProperty("class", "temp-row-lbl")
+        tr_lyt.addWidget(self._temp_lbl)
+        dot = QLabel("·")
+        dot.setProperty("class", "temp-row-lbl")
+        tr_lyt.addWidget(dot)
+        self._temp_val = QLabel("0.00")
+        self._temp_val.setProperty("class", "temp-row-val")
+        tr_lyt.addWidget(self._temp_val)
+        tr_lyt.addStretch(1)
+        temp_block.addWidget(temp_row)
+
+        self._temp_slider = QSlider(Qt.Orientation.Horizontal, side)
+        self._temp_slider.setProperty("class", "range")
         self._temp_slider.setMinimum(0)
-        self._temp_slider.setMaximum(20)
+        self._temp_slider.setMaximum(20)  # 0..1 step 0.05
         self._temp_slider.setSingleStep(1)
         self._temp_slider.setPageStep(2)
         self._temp_slider.valueChanged.connect(self._on_temp_changed)
-        temp_lyt.addWidget(self._temp_slider)
-        marks = QHBoxLayout()
-        marks.setContentsMargins(0, 0, 0, 0)
-        for txt in ("0", "0.5", "1"):
-            lbl = QLabel(txt)
-            lbl.setStyleSheet(
-                f"font-family: {FONT.mono}; font-size: 10px; color: {COLOR.text_4};"
-            )
-            marks.addWidget(lbl)
-            if txt != "1":
-                marks.addStretch(1)
-        temp_lyt.addLayout(marks)
+        temp_block.addWidget(self._temp_slider)
 
-        self._temp_field_wrap = _make_field(
-            "Temperature · 0.00",
-            temp_wrap,
-            "Lower = deterministic, higher = creative.",
-        )
-        right.addWidget(self._temp_field_wrap)
+        marks_row = QFrame(side)
+        marks_row.setProperty("class", "range-marks")
+        marks_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        m_lyt = QHBoxLayout(marks_row)
+        m_lyt.setContentsMargins(0, 0, 0, 0)
+        m_lyt.setSpacing(0)
+        for i, txt in enumerate(("0", "0.5", "1")):
+            mlbl = QLabel(txt)
+            mlbl.setProperty("class", "range-mark")
+            m_lyt.addWidget(mlbl)
+            if i < 2:
+                m_lyt.addStretch(1)
+        temp_block.addWidget(marks_row)
 
-        self._enabled_chk = QCheckBox("Show in launcher")
-        self._enabled_chk.setProperty("class", "ed-check")
-        self._enabled_chk.stateChanged.connect(self._on_enabled_changed)
-        right.addWidget(_make_field("Behavior", self._enabled_chk))
+        temp_hint = QLabel("Lower = deterministic, higher = creative.")
+        temp_hint.setProperty("class", "ed-field-hint")
+        temp_hint.setWordWrap(True)
+        temp_block.addWidget(temp_hint)
+        side_lyt.addLayout(temp_block)
 
-        right.addStretch(1)
+        # BEHAVIOR — checkbox using .behavior-check class
+        behavior_block = QVBoxLayout()
+        behavior_block.setContentsMargins(0, 0, 0, 0)
+        behavior_block.setSpacing(8)
+        b_lbl = QLabel("BEHAVIOR")
+        b_lbl.setProperty("class", "ed-field-lbl")
+        behavior_block.addWidget(b_lbl)
+        self._show_in_launcher = QCheckBox("Show in launcher", side)
+        self._show_in_launcher.setProperty("class", "behavior-check")
+        self._show_in_launcher.stateChanged.connect(self._on_enabled_changed)
+        behavior_block.addWidget(self._show_in_launcher)
+        side_lyt.addLayout(behavior_block)
 
-        right_wrap = QWidget()
-        right_wrap.setLayout(right)
-        right_wrap.setFixedWidth(260)
-        cols.addWidget(right_wrap, 0)
+        side_lyt.addStretch(1)
+        cols_lyt.addWidget(side, 0)
 
-        self._body_layout.addLayout(cols)
-        self._body_layout.addStretch(1)
+        self._body_layout.addWidget(cols_wrap, 1)
+
+    # -- public --------------------------------------------------------
 
     def populate(self, item: Item) -> None:
         self._current_id = item.id
-        self._emoji_box.setText(item.emoji or "")
-        self._kind_lbl.setText("●  AI ACTION")
-        self._kind_lbl.setStyleSheet(f"color: {COLOR.violet};")
+        self._render_hd_icon(_icon_for_item(item))
+
+        self._name_edit.blockSignals(True)
         self._name_edit.setText(item.name or "")
-        self._sub_lbl.setText(
-            "Runs against your clipboard contents and replaces them with the result."
-        )
+        self._name_edit.blockSignals(False)
 
         self._prompt_edit.blockSignals(True)
         self._prompt_edit.setPlainText(item.prompt or "")
         self._prompt_edit.blockSignals(False)
 
+        # Model combo: try to match a registered value, else show as raw text.
         self._model_combo.blockSignals(True)
-        target_value = (item.model or "")
+        target_value = item.model or ""
         match_idx = -1
         for i in range(self._model_combo.count()):
             if self._model_combo.itemData(i) == target_value:
@@ -666,7 +770,6 @@ class AIEditor(_EditorBase):
         if match_idx >= 0:
             self._model_combo.setCurrentIndex(match_idx)
         else:
-            # custom value pasted in
             self._model_combo.setEditText(target_value)
         self._model_combo.blockSignals(False)
 
@@ -675,32 +778,52 @@ class AIEditor(_EditorBase):
         self._temp_slider.blockSignals(True)
         self._temp_slider.setValue(int(round(clamped * 20)))
         self._temp_slider.blockSignals(False)
-        self._update_temp_label(clamped)
+        self._temp_val.setText(f"{clamped:.2f}")
 
-        self._enabled_chk.blockSignals(True)
-        self._enabled_chk.setChecked(bool(item.enabled))
-        self._enabled_chk.blockSignals(False)
+        self._show_in_launcher.blockSignals(True)
+        self._show_in_launcher.setChecked(bool(item.enabled))
+        self._show_in_launcher.blockSignals(False)
 
         self._hotkey_btn.setValue(item.hotkey or "")
 
         self._delete_btn.setVisible(bool(item.deletable))
         self._duplicate_btn.setVisible(bool(item.deletable))
-        self._change_emoji_btn.show()
-        self._name_edit.setReadOnly(False)
 
-    def _update_temp_label(self, value: float) -> None:
-        # Replace the existing label inside the temperature field wrap.
-        lyt = self._temp_field_wrap.layout()
-        if lyt is None or lyt.count() == 0:
-            return
-        item = lyt.itemAt(0)
-        if item is None:
-            return
-        w = item.widget()
-        if isinstance(w, QLabel):
-            w.setText(f"Temperature · {value:.2f}")
+    # -- internal ------------------------------------------------------
 
-    # Slot handlers ----------------------------------------------------
+    def _render_hd_icon(self, name: str) -> None:
+        self._hd_ic.setPixmap(icon(name, COLOR.violet, 28).pixmap(icon_size(28)))
+
+    def _on_name_edited(self, text: str) -> None:
+        if self._current_id is None:
+            return
+        self.nameChanged.emit(self._current_id, text)
+
+    def _on_change_emoji(self) -> None:
+        # Kept for behavioral parity with the previous editor (and the JSX
+        # action button). Updates the underlying Item.emoji even though the
+        # new design favors SVG icons; harmless for downstream consumers.
+        if self._current_id is None:
+            return
+        new, ok = QInputDialog.getText(
+            self, "Change emoji", "Emoji or character:", QLineEdit.EchoMode.Normal, ""
+        )
+        if not ok:
+            return
+        new = (new or "").strip()
+        if not new:
+            return
+        self.emojiChanged.emit(self._current_id, new)
+
+    def _on_duplicate(self) -> None:
+        if self._current_id is None:
+            return
+        self.duplicateRequested.emit(self._current_id)
+
+    def _on_delete(self) -> None:
+        if self._current_id is None:
+            return
+        self.deleteRequested.emit(self._current_id)
 
     def _on_prompt_changed(self) -> None:
         if self._current_id is None:
@@ -718,8 +841,10 @@ class AIEditor(_EditorBase):
     def _on_model_text_finished(self) -> None:
         if self._current_id is None:
             return
-        text = self._model_combo.lineEdit().text().strip()
-        # If text matches a known label, use the data value; else treat as raw model id.
+        line_edit = self._model_combo.lineEdit()
+        if line_edit is None:
+            return
+        text = line_edit.text().strip()
         for i in range(self._model_combo.count()):
             if self._model_combo.itemText(i) == text:
                 value = self._model_combo.itemData(i)
@@ -729,7 +854,7 @@ class AIEditor(_EditorBase):
 
     def _on_temp_changed(self, raw: int) -> None:
         value = raw / 20.0
-        self._update_temp_label(value)
+        self._temp_val.setText(f"{value:.2f}")
         if self._current_id is None:
             return
         self.temperatureChanged.emit(self._current_id, value)
@@ -741,276 +866,29 @@ class AIEditor(_EditorBase):
 
 
 # ---------------------------------------------------------------------------
-# Snippet editor
-# ---------------------------------------------------------------------------
-
-class SnippetEditor(_EditorBase):
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._build_body()
-
-    def _build_body(self) -> None:
-        self._clear_body()
-
-        cols = QHBoxLayout()
-        cols.setContentsMargins(0, 0, 0, 0)
-        cols.setSpacing(22)
-
-        # Left: body
-        left = QVBoxLayout()
-        left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(18)
-
-        self._body_text = QTextEdit()
-        self._body_text.setProperty("class", "ed-textarea ed-mono")
-        self._body_text.setMinimumHeight(160)
-        self._body_text.textChanged.connect(self._on_body_text_changed)
-
-        self._body_url = QLineEdit()
-        self._body_url.setProperty("class", "ed-input ed-mono")
-        self._body_url.setPlaceholderText("https://…")
-        self._body_url.textEdited.connect(self._on_body_url_edited)
-        self._body_url.hide()
-
-        self._body_field_wrap = QWidget()
-        bf_lyt = QVBoxLayout(self._body_field_wrap)
-        bf_lyt.setContentsMargins(0, 0, 0, 0)
-        bf_lyt.setSpacing(7)
-        self._body_lbl = QLabel("SNIPPET TEXT")
-        self._body_lbl.setProperty("class", "ed-field-lbl")
-        bf_lyt.addWidget(self._body_lbl)
-        bf_lyt.addWidget(self._body_text)
-        bf_lyt.addWidget(self._body_url)
-        self._body_hint = QLabel("Goes straight to the clipboard.")
-        self._body_hint.setProperty("class", "ed-field-hint")
-        self._body_hint.setWordWrap(True)
-        bf_lyt.addWidget(self._body_hint)
-
-        left.addWidget(self._body_field_wrap)
-        left.addStretch(1)
-
-        left_wrap = QWidget()
-        left_wrap.setLayout(left)
-        cols.addWidget(left_wrap, 1)
-
-        # Right: type segmented + behavior radios + enabled
-        right = QVBoxLayout()
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(18)
-
-        seg_wrap = QFrame()
-        seg_wrap.setProperty("class", "ed-seg")
-        seg_wrap.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        seg_lyt = QHBoxLayout(seg_wrap)
-        seg_lyt.setContentsMargins(3, 3, 3, 3)
-        seg_lyt.setSpacing(3)
-        self._kind_text_btn = QPushButton("Text")
-        self._kind_text_btn.setProperty("class", "ed-seg-btn")
-        self._kind_text_btn.setProperty("on", "true")
-        self._kind_text_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._kind_text_btn.clicked.connect(lambda: self._on_kind_changed("text"))
-        self._kind_url_btn = QPushButton("URL")
-        self._kind_url_btn.setProperty("class", "ed-seg-btn")
-        self._kind_url_btn.setProperty("on", "false")
-        self._kind_url_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._kind_url_btn.clicked.connect(lambda: self._on_kind_changed("url"))
-        seg_lyt.addWidget(self._kind_text_btn, 1)
-        seg_lyt.addWidget(self._kind_url_btn, 1)
-        right.addWidget(_make_field("Type", seg_wrap))
-
-        # Behavior radios (text-only)
-        self._behavior_group = QButtonGroup(self)
-        self._behavior_group.setExclusive(True)
-        behavior_wrap = QWidget()
-        bw_lyt = QVBoxLayout(behavior_wrap)
-        bw_lyt.setContentsMargins(0, 0, 0, 0)
-        bw_lyt.setSpacing(0)
-
-        self._rb_replace = QRadioButton("Replace clipboard (default)")
-        self._rb_replace.setProperty("class", "ed-radio")
-        self._rb_replace.toggled.connect(lambda c: c and self._on_behavior_changed("replace"))
-        bw_lyt.addWidget(self._rb_replace)
-
-        self._rb_append = QRadioButton("Append to clipboard")
-        self._rb_append.setProperty("class", "ed-radio")
-        self._rb_append.toggled.connect(lambda c: c and self._on_behavior_changed("append"))
-        bw_lyt.addWidget(self._rb_append)
-
-        self._rb_autopaste = QRadioButton("Copy + auto-paste")
-        self._rb_autopaste.setProperty("class", "ed-radio")
-        self._rb_autopaste.toggled.connect(lambda c: c and self._on_behavior_changed("autopaste"))
-        bw_lyt.addWidget(self._rb_autopaste)
-
-        self._behavior_group.addButton(self._rb_replace)
-        self._behavior_group.addButton(self._rb_append)
-        self._behavior_group.addButton(self._rb_autopaste)
-
-        self._behavior_field = _make_field("On trigger", behavior_wrap)
-        right.addWidget(self._behavior_field)
-
-        self._enabled_chk = QCheckBox("Show in launcher")
-        self._enabled_chk.setProperty("class", "ed-check")
-        self._enabled_chk.stateChanged.connect(self._on_enabled_changed)
-        right.addWidget(_make_field("Visibility", self._enabled_chk))
-
-        right.addStretch(1)
-
-        right_wrap = QWidget()
-        right_wrap.setLayout(right)
-        right_wrap.setFixedWidth(260)
-        cols.addWidget(right_wrap, 0)
-
-        self._body_layout.addLayout(cols)
-        self._body_layout.addStretch(1)
-
-    def populate(self, item: Item) -> None:
-        self._current_id = item.id
-        self._emoji_box.setText(item.emoji or "")
-        is_url = (item.kind or "text").lower() == "url"
-
-        if is_url:
-            self._kind_lbl.setText("●  URL SNIPPET")
-            self._kind_lbl.setStyleSheet(f"color: {COLOR.url_blue};")
-            self._sub_lbl.setText(
-                "Opens the URL in your default browser. Doesn't touch the clipboard."
-            )
-        else:
-            self._kind_lbl.setText("●  TEXT SNIPPET")
-            self._kind_lbl.setStyleSheet(f"color: {COLOR.mint};")
-            self._sub_lbl.setText(
-                "Replaces the clipboard with this text. Paste it anywhere with Ctrl+V."
-            )
-
-        self._name_edit.setText(item.name or "")
-        self._name_edit.setReadOnly(False)
-        self._change_emoji_btn.show()
-        self._duplicate_btn.setVisible(bool(item.deletable))
-        self._delete_btn.setVisible(bool(item.deletable))
-
-        # body
-        if is_url:
-            self._body_lbl.setText("URL")
-            self._body_hint.setText("Opens in your default browser when fired.")
-            self._body_text.hide()
-            self._body_url.show()
-            self._body_url.blockSignals(True)
-            self._body_url.setText(item.body or "")
-            self._body_url.blockSignals(False)
-        else:
-            self._body_lbl.setText("SNIPPET TEXT")
-            self._body_hint.setText("Goes straight to the clipboard.")
-            self._body_url.hide()
-            self._body_text.show()
-            self._body_text.blockSignals(True)
-            self._body_text.setPlainText(item.body or "")
-            self._body_text.blockSignals(False)
-
-        # Segmented control state
-        self._kind_text_btn.setProperty("on", "false" if is_url else "true")
-        self._kind_url_btn.setProperty("on", "true" if is_url else "false")
-        _repolish(self._kind_text_btn)
-        _repolish(self._kind_url_btn)
-
-        # Behavior radios — only meaningful for text
-        self._behavior_field.setVisible(not is_url)
-        behavior = (item.behavior or "replace").lower()
-        for rb, key in (
-            (self._rb_replace, "replace"),
-            (self._rb_append, "append"),
-            (self._rb_autopaste, "autopaste"),
-        ):
-            rb.blockSignals(True)
-            rb.setChecked(behavior == key)
-            rb.blockSignals(False)
-
-        self._enabled_chk.blockSignals(True)
-        self._enabled_chk.setChecked(bool(item.enabled))
-        self._enabled_chk.blockSignals(False)
-
-        self._hotkey_btn.setValue(item.hotkey or "")
-
-    def _on_body_text_changed(self) -> None:
-        if self._current_id is None:
-            return
-        self.bodyChanged.emit(self._current_id, self._body_text.toPlainText())
-
-    def _on_body_url_edited(self, text: str) -> None:
-        if self._current_id is None:
-            return
-        self.bodyChanged.emit(self._current_id, text)
-
-    def _on_kind_changed(self, kind: str) -> None:
-        if self._current_id is None:
-            return
-        self.kindChanged.emit(self._current_id, kind)
-
-    def _on_behavior_changed(self, behavior: str) -> None:
-        if self._current_id is None:
-            return
-        self.behaviorChanged.emit(self._current_id, behavior)
-
-    def _on_enabled_changed(self, state: int) -> None:
-        if self._current_id is None:
-            return
-        self.enabledChanged.emit(self._current_id, state == Qt.CheckState.Checked.value)
-
-
-# ---------------------------------------------------------------------------
-# Launcher hotkey editor (pseudo-item for the launcher itself)
-# ---------------------------------------------------------------------------
-
-class LauncherEditor(_EditorBase):
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._name_edit.setReadOnly(True)
-        self._change_emoji_btn.hide()
-        self._duplicate_btn.hide()
-        self._delete_btn.hide()
-        self._build_body()
-
-    def _build_body(self) -> None:
-        self._clear_body()
-        note = QLabel(
-            "This is the global hotkey that opens the launcher popup from anywhere. "
-            "Pick a chord with at least one of Ctrl, Alt, Shift, or Win."
-        )
-        note.setStyleSheet(f"color: {COLOR.text_2}; font-size: 12px;")
-        note.setWordWrap(True)
-        self._body_layout.addWidget(note)
-        self._body_layout.addStretch(1)
-
-    def populate(self, hotkey: str) -> None:
-        self._current_id = LAUNCHER_PSEUDO_ID
-        self._emoji_box.setText("▶")
-        self._kind_lbl.setText("●  LAUNCHER")
-        self._kind_lbl.setStyleSheet(f"color: {COLOR.violet};")
-        self._name_edit.setText("Open the launcher popup")
-        self._sub_lbl.setText("Global trigger — works from any window.")
-        self._hotkey_btn.setValue(hotkey or "")
-
-
-# ---------------------------------------------------------------------------
 # Manager window
 # ---------------------------------------------------------------------------
 
 class ManagerWindow(QWidget):
-    """Frameless dashboard for editing the unified action library."""
+    """Frameless dashboard for editing the unified action library.
+
+    Public signals/methods are part of the contract with ``tray_controller``;
+    do not rename without updating the controller.
+    """
 
     configChanged = pyqtSignal(object)
     closeRequested = pyqtSignal()
 
-    # Editor indices in the QStackedWidget
+    # Editor indices in the QStackedWidget.
     IDX_EMPTY = 0
-    IDX_LAUNCHER = 1
-    IDX_SYSTEM = 2
-    IDX_AI = 3
-    IDX_SNIPPET = 4
+    IDX_SYSTEM = 1     # also serves Launcher pseudo-item + Snippet rows
+    IDX_AI = 2
 
-    def __init__(self, config: Config, config_path: Path, parent: Optional[QWidget] = None):
+    def __init__(self, config: Config, config_path: Path,
+                 parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
@@ -1035,11 +913,14 @@ class ManagerWindow(QWidget):
 
     def _build_chrome(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(OUTER_PADDING, OUTER_PADDING, OUTER_PADDING, OUTER_PADDING)
+        outer.setContentsMargins(OUTER_PADDING, OUTER_PADDING,
+                                  OUTER_PADDING, OUTER_PADDING)
         outer.setSpacing(0)
 
+        # Outer .win card (fixed 1000×660 per handoff).
         self._card = QFrame(self)
         self._card.setObjectName("managerCard")
+        self._card.setProperty("class", "win mgr")
         self._card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._card.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
         outer.addWidget(self._card)
@@ -1048,39 +929,47 @@ class ManagerWindow(QWidget):
         card_lyt.setContentsMargins(0, 0, 0, 0)
         card_lyt.setSpacing(0)
 
-        # Titlebar
-        self._titlebar = QWidget(self._card)
+        # Titlebar (.win-hd.bordered): brand mark + title block + close.
+        self._titlebar = QFrame(self._card)
         self._titlebar.setObjectName("managerTitlebar")
+        self._titlebar.setProperty("class", "win-hd bordered")
         self._titlebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._titlebar.setFixedHeight(44)
+        self._titlebar.setFixedHeight(48)
         self._titlebar.setCursor(Qt.CursorShape.SizeAllCursor)
         tb = QHBoxLayout(self._titlebar)
         tb.setContentsMargins(16, 0, 10, 0)
-        tb.setSpacing(8)
+        tb.setSpacing(10)
 
-        brand_mark = QLabel("✓")
-        brand_mark.setProperty("class", "brand-mark")
-        brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        brand_mark.setFixedSize(18, 18)
-        brand_mark.setStyleSheet(
-            f"background: {COLOR.violet}; color: #FFFFFF; border-radius: 5px;"
-            f" font-size: 11px; font-weight: 700;"
-        )
-        tb.addWidget(brand_mark)
+        # Brand mark — gradient circle containing the rec-launcher glyph.
+        brand_mark = QFrame(self._titlebar)
+        brand_mark.setProperty("class", "brand-mark sm")
+        brand_mark.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        bm_lyt = QHBoxLayout(brand_mark)
+        bm_lyt.setContentsMargins(0, 0, 0, 0)
+        bm_lyt.setSpacing(0)
+        glyph = QLabel(brand_mark)
+        glyph.setPixmap(icon("rec_launcher", "#FFFFFF", 13).pixmap(icon_size(13)))
+        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        glyph.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        bm_lyt.addWidget(glyph, 0, Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(brand_mark, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        title_lbl = QLabel("Shortcut")
-        title_lbl.setProperty("class", "mgr-title")
-        tb.addWidget(title_lbl)
+        # Brand title block: "AI Util Hub / Manage Library".
+        brand_title = QLabel("AI Util Hub", self._titlebar)
+        brand_title.setProperty("class", "brand-title")
+        tb.addWidget(brand_title, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        sep = QLabel("/")
-        sep.setStyleSheet(f"color: {COLOR.text_4}; margin: 0 4px;")
-        tb.addWidget(sep)
+        slash = QLabel("/", self._titlebar)
+        slash.setProperty("class", "brand-title-slash")
+        slash.setStyleSheet(f"color: {COLOR.text_4}; margin: 0 4px;")
+        tb.addWidget(slash, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        sub = QLabel("Manage Library")
-        sub.setStyleSheet(f"color: {COLOR.text_2}; font-size: 12px; font-weight: 500;")
-        tb.addWidget(sub)
+        sub = QLabel("Manage Library", self._titlebar)
+        sub.setProperty("class", "brand-title-sub")
+        tb.addWidget(sub, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self._dirty_lbl = QLabel("• Unsaved changes")
+        # Subtle dirty-state indicator (no JSX equivalent but useful to keep).
+        self._dirty_lbl = QLabel("• Unsaved changes", self._titlebar)
         self._dirty_lbl.setStyleSheet(
             f"color: {COLOR.amber}; font-size: 11px; font-weight: 500; margin-left: 10px;"
         )
@@ -1089,27 +978,36 @@ class ManagerWindow(QWidget):
 
         tb.addStretch(1)
 
-        close_btn = QPushButton("✕")
-        close_btn.setProperty("class", "icon-btn")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn = QPushButton(self._titlebar)
+        close_btn.setProperty("class", "icon-btn close")
+        close_btn.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        close_btn.setIcon(icon("close", COLOR.text_2, 14))
+        close_btn.setIconSize(icon_size(14))
         close_btn.setFixedSize(28, 28)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_btn.setToolTip("Close (Esc)")
         close_btn.clicked.connect(self._on_close_clicked)
         tb.addWidget(close_btn)
 
         card_lyt.addWidget(self._titlebar)
         self._titlebar.installEventFilter(self)
 
-        # Body: rail + editor
-        body = QHBoxLayout()
+        # Body (.mgr-body): rail + edit pane.
+        body_host = QFrame(self._card)
+        body_host.setProperty("class", "mgr-body")
+        body_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        body = QHBoxLayout(body_host)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
-        card_lyt.addLayout(body, 1)
+        card_lyt.addWidget(body_host, 1)
 
         self._rail = self._build_rail()
         body.addWidget(self._rail)
 
-        self._edit_pane = QWidget(self._card)
+        self._edit_pane = QFrame(body_host)
         self._edit_pane.setObjectName("managerEdit")
+        self._edit_pane.setProperty("class", "mgr-edit")
         self._edit_pane.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         edit_lyt = QVBoxLayout(self._edit_pane)
         edit_lyt.setContentsMargins(0, 0, 0, 0)
@@ -1118,75 +1016,96 @@ class ManagerWindow(QWidget):
         self._stack = QStackedWidget(self._edit_pane)
         edit_lyt.addWidget(self._stack)
 
-        # Index 0: empty placeholder
+        # Index 0: empty placeholder.
         empty = QWidget()
         ev = QVBoxLayout(empty)
         ev.setContentsMargins(40, 40, 40, 40)
-        ev.setSpacing(8)
         ev.addStretch(1)
         ep = QLabel("Select an item from the left to edit.")
-        ep.setStyleSheet(f"color: {COLOR.text_2}; font-size: 13px;")
+        ep.setStyleSheet(f"color: {COLOR.text_3}; font-size: 13px;")
         ep.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev.addWidget(ep)
         ev.addStretch(1)
         self._stack.insertWidget(self.IDX_EMPTY, empty)
 
-        # Index 1..4: real editors
-        self._launcher_editor = LauncherEditor()
+        # Index 1: System editor (also handles Launcher + Snippet).
+        # Index 2: AI Action editor.
         self._system_editor = SystemEditor()
-        self._ai_editor = AIEditor()
-        self._snippet_editor = SnippetEditor()
-        self._stack.insertWidget(self.IDX_LAUNCHER, self._launcher_editor)
+        self._ai_editor = AIActionEditor()
         self._stack.insertWidget(self.IDX_SYSTEM, self._system_editor)
         self._stack.insertWidget(self.IDX_AI, self._ai_editor)
-        self._stack.insertWidget(self.IDX_SNIPPET, self._snippet_editor)
 
         body.addWidget(self._edit_pane, 1)
 
     def _build_rail(self) -> QWidget:
-        rail = QWidget(self._card)
+        rail = QFrame(self._card)
         rail.setObjectName("managerRail")
+        rail.setProperty("class", "mgr-rail")
         rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         rail.setFixedWidth(RAIL_WIDTH)
         rl = QVBoxLayout(rail)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
-        head = QWidget(rail)
+        head = QFrame(rail)
         head.setObjectName("managerRailHead")
         head.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         hl = QVBoxLayout(head)
         hl.setContentsMargins(14, 14, 14, 10)
         hl.setSpacing(10)
 
-        # Search field with leading icon overlay
+        # Search field with leading icon overlay (.mgr-search has 30px
+        # left-padding to clear the absolutely-positioned glyph).
         search_wrap = QFrame(head)
         search_wrap.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         search_wrap.setStyleSheet("background: transparent; border: 0;")
-        sw = QHBoxLayout(search_wrap)
-        sw.setContentsMargins(0, 0, 0, 0)
-        sw.setSpacing(0)
+
+        sw_outer = QVBoxLayout(search_wrap)
+        sw_outer.setContentsMargins(0, 0, 0, 0)
+        sw_outer.setSpacing(0)
 
         self._search = QLineEdit(search_wrap)
         self._search.setProperty("class", "mgr-search")
-        self._search.setPlaceholderText("\U0001F50D  Search library…")
+        self._search.setPlaceholderText("Search library…")
         self._search.textChanged.connect(self._on_search_changed)
-        sw.addWidget(self._search, 1)
+        sw_outer.addWidget(self._search)
+
+        # Floating leading icon (parented to the search wrap; positioned in
+        # showEvent / resizeEvent via fixed offsets — close enough for this
+        # static layout).
+        self._search_icon_lbl = QLabel(search_wrap)
+        self._search_icon_lbl.setPixmap(
+            icon("search", COLOR.text_3, 14).pixmap(icon_size(14))
+        )
+        self._search_icon_lbl.setFixedSize(14, 14)
+        self._search_icon_lbl.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._search_icon_lbl.move(10, 10)  # static offset matches 32px input
+        self._search_icon_lbl.raise_()
+
         hl.addWidget(search_wrap)
 
-        # Tabs
+        # Tabs (.mgr-tabs / .mgr-tab)
         tabs = QFrame(head)
-        tabs.setObjectName("managerTabs")
+        tabs.setProperty("class", "mgr-tabs")
         tabs.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         tl = QHBoxLayout(tabs)
         tl.setContentsMargins(3, 3, 3, 3)
         tl.setSpacing(4)
         self._tab_buttons: dict[str, QPushButton] = {}
-        for key, label in (("all", "All"), ("system", "System"), ("ai", "AI"), ("snippet", "Snippets")):
-            btn = QPushButton(label)
+        for key, label in (
+            ("all", "All"),
+            ("system", "System"),
+            ("ai", "AI"),
+            ("snippet", "Snippets"),
+        ):
+            btn = QPushButton(label, tabs)
             btn.setProperty("class", "mgr-tab")
             btn.setProperty("on", "true" if key == self._active_tab else "false")
+            btn.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.clicked.connect(lambda _checked=False, k=key: self._on_tab_changed(k))
             tl.addWidget(btn, 1)
             self._tab_buttons[key] = btn
@@ -1194,14 +1113,18 @@ class ManagerWindow(QWidget):
 
         rl.addWidget(head)
 
-        # Scrollable list
+        # Scrollable list (.mgr-list)
         self._list_scroll = QScrollArea(rail)
         self._list_scroll.setWidgetResizable(True)
         self._list_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self._list_scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
 
-        self._list_body = QWidget()
+        self._list_body = QFrame()
+        self._list_body.setProperty("class", "mgr-list")
+        self._list_body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._list_body.setStyleSheet("background: transparent;")
         self._list_layout = QVBoxLayout(self._list_body)
         self._list_layout.setContentsMargins(8, 8, 8, 12)
@@ -1217,7 +1140,7 @@ class ManagerWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _wire_editors(self) -> None:
-        for editor in (self._launcher_editor, self._system_editor, self._ai_editor, self._snippet_editor):
+        for editor in (self._system_editor, self._ai_editor):
             editor.saveClicked.connect(self._on_save_clicked)
             editor.hotkeyChanged.connect(self._on_hotkey_changed)
             editor.deleteRequested.connect(self._on_delete_requested)
@@ -1230,12 +1153,8 @@ class ManagerWindow(QWidget):
         self._ai_editor.modelChanged.connect(self._on_model_changed)
         self._ai_editor.temperatureChanged.connect(self._on_temperature_changed)
 
-        self._snippet_editor.bodyChanged.connect(self._on_body_changed)
-        self._snippet_editor.kindChanged.connect(self._on_kind_changed)
-        self._snippet_editor.behaviorChanged.connect(self._on_behavior_changed)
-
     # ------------------------------------------------------------------
-    # Public API
+    # Public API (preserved surface — wired by tray_controller)
     # ------------------------------------------------------------------
 
     def set_config(self, config: Config) -> None:
@@ -1243,7 +1162,6 @@ class ManagerWindow(QWidget):
         self._working_config = copy.deepcopy(config)
         self._refresh_dirty_indicator()
         self._rebuild_list()
-        # Re-select if possible
         if self._selected_id and (
             self._selected_id == LAUNCHER_PSEUDO_ID
             or self._find_item(self._selected_id) is not None
@@ -1254,7 +1172,6 @@ class ManagerWindow(QWidget):
 
     def present(self) -> None:
         self.adjustSize()
-        # Fixed inner card; outer translucent widget gets +padding.
         self.resize(CARD_WIDTH + OUTER_PADDING * 2, CARD_HEIGHT + OUTER_PADDING * 2)
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         if screen is not None:
@@ -1286,20 +1203,13 @@ class ManagerWindow(QWidget):
             parts.append(item.body)
         return any(q in (p or "").lower() for p in parts)
 
-    def _format_hotkey_chip(self, hotkey: str) -> str:
-        if not hotkey:
-            return ""
-        # Compact: just the trailing key.
-        try:
-            tail = hotkey.split("+")[-1].strip()
-        except Exception:
-            return ""
-        if tail.startswith("<") and tail.endswith(">"):
-            tail = tail[1:-1]
-        return tail.upper()[:4]
+    def _matches_launcher_filter(self, query: str) -> bool:
+        if not query:
+            return True
+        return query.lower() in "launcher (open popup)"
 
     def _rebuild_list(self) -> None:
-        # Clear
+        # Clear existing rows.
         while self._list_layout.count():
             child = self._list_layout.takeAt(0)
             w = child.widget()
@@ -1316,75 +1226,92 @@ class ManagerWindow(QWidget):
         show_ai = self._active_tab in ("all", "ai")
         show_snip = self._active_tab in ("all", "snippet")
 
-        # --- LAUNCHER pseudo-row (always at top, treated as system)
+        # SYSTEM group (square dot per JSX) — always includes the launcher
+        # pseudo-row at the top.
         if show_system:
-            self._add_group_header("SYSTEM", COLOR.violet)
-            # Launcher pseudo-row
-            launcher_chip = self._format_hotkey_chip(self._working_config.launcher_hotkey)
-            launcher_row = LibraryRow(
-                LAUNCHER_PSEUDO_ID, "▶", "Launcher (open popup)",
-                launcher_chip, "❖",
-            )
-            launcher_row.rowClicked.connect(self._on_row_clicked)
-            self._row_widgets[LAUNCHER_PSEUDO_ID] = launcher_row
-            self._list_layout.addWidget(launcher_row)
+            self._add_group_header("System", COLOR.text_3, dot_kind="square")
+            if self._matches_launcher_filter(query):
+                launcher_chip = _format_hotkey_chip(self._working_config.launcher_hotkey)
+                launcher_row = LibraryRow(
+                    LAUNCHER_PSEUDO_ID, "rec_launcher",
+                    "Launcher (open popup)", launcher_chip,
+                )
+                launcher_row.rowClicked.connect(self._on_row_clicked)
+                self._row_widgets[LAUNCHER_PSEUDO_ID] = launcher_row
+                self._list_layout.addWidget(launcher_row)
 
             for item in self._items_by_type("system"):
                 if not self._matches_filter(item, query):
                     continue
-                self._add_item_row(item, "✨")
+                self._add_item_row(item)
 
+        # AI ACTIONS group (violet dot)
         if show_ai:
-            self._add_group_header("AI ACTIONS", COLOR.violet, add_section="ai")
+            self._add_group_header(
+                "AI Actions", COLOR.violet, dot_kind="round", add_section="ai",
+            )
             for item in self._items_by_type("ai"):
                 if not self._matches_filter(item, query):
                     continue
-                self._add_item_row(item, "✨")
+                self._add_item_row(item)
 
+        # SNIPPETS group (mint dot)
         if show_snip:
-            self._add_group_header("SNIPPETS", COLOR.mint, add_section="snippet")
+            self._add_group_header(
+                "Snippets", COLOR.mint, dot_kind="round", add_section="snippet",
+            )
             for item in self._items_by_type("snippet"):
                 if not self._matches_filter(item, query):
                     continue
-                glyph = "\U0001F517" if (item.kind or "").lower() == "url" else "\U0001F4CB"
-                self._add_item_row(item, glyph)
+                self._add_item_row(item)
 
         self._list_layout.addStretch(1)
 
-        # Refresh selected highlight
         if self._selected_id is not None and self._selected_id in self._row_widgets:
             self._row_widgets[self._selected_id].set_selected(True)
 
-    def _add_group_header(self, title: str, dot_color: str, add_section: Optional[str] = None) -> None:
-        row = QWidget()
+    def _add_group_header(self, title: str, dot_color: str, *,
+                          dot_kind: str = "round",
+                          add_section: Optional[str] = None) -> None:
+        row = QFrame(self._list_body)
+        row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        row.setStyleSheet("background: transparent;")
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(8, 12, 8, 6)
-        rl.setSpacing(6)
+        rl.setContentsMargins(8, 14, 8, 6)
+        rl.setSpacing(8)
 
-        dot = QLabel()
-        dot.setFixedSize(5, 5)
-        dot.setStyleSheet(f"background: {dot_color}; border-radius: 2.5px;")
-        rl.addWidget(dot)
+        dot = QLabel(row)
+        dot.setFixedSize(6, 6)
+        radius = "1px" if dot_kind == "square" else "3px"
+        dot.setStyleSheet(f"background: {dot_color}; border-radius: {radius};")
+        rl.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        lbl = QLabel(title)
+        lbl = QLabel(title, row)
         lbl.setProperty("class", "mgr-grp")
         rl.addWidget(lbl)
 
         rl.addStretch(1)
 
         if add_section is not None:
-            add_btn = QPushButton("+")
+            add_btn = QPushButton(row)
             add_btn.setProperty("class", "mgr-add")
+            add_btn.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            add_btn.setIcon(icon("plus", COLOR.text_2, 12))
+            add_btn.setIconSize(icon_size(12))
             add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            add_btn.setFixedSize(18, 18)
-            add_btn.clicked.connect(lambda _checked=False, s=add_section: self._on_add_clicked(s))
+            add_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            add_btn.setToolTip(f"Add {title.lower()}")
+            add_btn.clicked.connect(
+                lambda _checked=False, s=add_section: self._on_add_clicked(s)
+            )
             rl.addWidget(add_btn)
 
         self._list_layout.addWidget(row)
 
-    def _add_item_row(self, item: Item, type_glyph: str) -> None:
-        chip = self._format_hotkey_chip(item.hotkey)
-        row = LibraryRow(item.id, item.emoji or "", item.name or "(unnamed)", chip, type_glyph)
+    def _add_item_row(self, item: Item) -> None:
+        chip = _format_hotkey_chip(item.hotkey)
+        row = LibraryRow(item.id, _icon_for_item(item),
+                         item.name or "(unnamed)", chip)
         row.rowClicked.connect(self._on_row_clicked)
         self._row_widgets[item.id] = row
         self._list_layout.addWidget(row)
@@ -1405,22 +1332,19 @@ class ManagerWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _select_initial(self) -> None:
-        # Prefer launcher row so the user knows it's editable.
         self._select(LAUNCHER_PSEUDO_ID)
 
     def _select(self, item_id: str) -> None:
-        # Clear highlight on previous
         if self._selected_id is not None and self._selected_id in self._row_widgets:
             self._row_widgets[self._selected_id].set_selected(False)
         self._selected_id = item_id
         if item_id in self._row_widgets:
             self._row_widgets[item_id].set_selected(True)
 
-        # Pick the editor
         if item_id == LAUNCHER_PSEUDO_ID:
-            self._launcher_editor.populate(self._working_config.launcher_hotkey)
-            self._stack.setCurrentIndex(self.IDX_LAUNCHER)
-            self._refresh_warning_banner(self._launcher_editor)
+            self._system_editor.populate_launcher(self._working_config.launcher_hotkey)
+            self._stack.setCurrentIndex(self.IDX_SYSTEM)
+            self._refresh_warning_banner(self._system_editor)
             return
 
         item = self._find_item(item_id)
@@ -1429,17 +1353,17 @@ class ManagerWindow(QWidget):
             return
 
         if item.type == "system":
-            self._system_editor.populate(item)
+            self._system_editor.populate_system(item)
             self._stack.setCurrentIndex(self.IDX_SYSTEM)
             self._refresh_warning_banner(self._system_editor)
         elif item.type == "ai":
             self._ai_editor.populate(item)
             self._stack.setCurrentIndex(self.IDX_AI)
             self._refresh_warning_banner(self._ai_editor)
-        else:
-            self._snippet_editor.populate(item)
-            self._stack.setCurrentIndex(self.IDX_SNIPPET)
-            self._refresh_warning_banner(self._snippet_editor)
+        else:  # snippet
+            self._system_editor.populate_snippet(item)
+            self._stack.setCurrentIndex(self.IDX_SYSTEM)
+            self._refresh_warning_banner(self._system_editor)
 
     def _find_item(self, item_id: str) -> Optional[Item]:
         for it in self._working_config.items:
@@ -1466,21 +1390,15 @@ class ManagerWindow(QWidget):
         self._select(item_id)
 
     def _on_add_clicked(self, section: str) -> None:
-        emoji, ok = QInputDialog.getText(
-            self, "New item", "Emoji (one character):",
-            QLineEdit.EchoMode.Normal,
-            "✨" if section == "ai" else "\U0001F4CB",
-        )
-        if not ok:
-            return
-        emoji = (emoji or "").strip() or ("✨" if section == "ai" else "\U0001F4CB")
         name, ok = QInputDialog.getText(
             self, "New item", "Name:", QLineEdit.EchoMode.Normal,
             "Untitled action" if section == "ai" else "Untitled snippet",
         )
         if not ok:
             return
-        name = (name or "").strip() or ("Untitled action" if section == "ai" else "Untitled snippet")
+        name = (name or "").strip() or (
+            "Untitled action" if section == "ai" else "Untitled snippet"
+        )
 
         max_order = max(
             (it.order for it in self._working_config.items),
@@ -1491,7 +1409,7 @@ class ManagerWindow(QWidget):
                 id=new_item_id("ai"),
                 type="ai",
                 name=name,
-                emoji=emoji,
+                emoji="✨",
                 hotkey="",
                 enabled=True,
                 order=max_order + 1,
@@ -1505,7 +1423,7 @@ class ManagerWindow(QWidget):
                 id=new_item_id("sn"),
                 type="snippet",
                 name=name,
-                emoji=emoji,
+                emoji="\U0001F4CB",
                 hotkey="",
                 enabled=True,
                 order=max_order + 1,
@@ -1523,7 +1441,9 @@ class ManagerWindow(QWidget):
         item = self._find_item(item_id)
         if item is None or not item.deletable:
             return
-        self._working_config.items = [it for it in self._working_config.items if it.id != item_id]
+        self._working_config.items = [
+            it for it in self._working_config.items if it.id != item_id
+        ]
         self._refresh_dirty_indicator()
         if self._selected_id == item_id:
             self._selected_id = LAUNCHER_PSEUDO_ID
@@ -1535,7 +1455,9 @@ class ManagerWindow(QWidget):
         item = self._find_item(item_id)
         if item is None or not item.deletable:
             return
-        max_order = max((it.order for it in self._working_config.items), default=-1)
+        max_order = max(
+            (it.order for it in self._working_config.items), default=-1
+        )
         prefix = "ai" if item.type == "ai" else "sn"
         clone = Item(
             id=new_item_id(prefix),
@@ -1566,9 +1488,8 @@ class ManagerWindow(QWidget):
         if item is None or item.type == "system":
             return
         item.name = name
-        if item_id in self._row_widgets:
-            # Cheap: rebuild the row text by full list rebuild.
-            self._rebuild_list()
+        # Cheap rebuild to reflect the name in the rail.
+        self._rebuild_list()
         self._refresh_dirty_indicator()
 
     def _on_emoji_changed(self, item_id: str, emoji: str) -> None:
@@ -1596,10 +1517,8 @@ class ManagerWindow(QWidget):
             item.hotkey = value
         self._refresh_dirty_indicator()
         self._rebuild_list()
-        # Re-select to refresh the row chip highlight.
         if self._selected_id is not None and self._selected_id in self._row_widgets:
             self._row_widgets[self._selected_id].set_selected(True)
-        # Immediate conflict surface
         editor = self._current_editor()
         if editor is not None:
             self._refresh_warning_banner(editor)
@@ -1625,39 +1544,17 @@ class ManagerWindow(QWidget):
         item.temperature = float(value)
         self._refresh_dirty_indicator()
 
-    def _on_body_changed(self, item_id: str, body: str) -> None:
-        item = self._find_item(item_id)
-        if item is None or item.type != "snippet":
-            return
-        item.body = body
-        self._refresh_dirty_indicator()
-
-    def _on_kind_changed(self, item_id: str, kind: str) -> None:
-        item = self._find_item(item_id)
-        if item is None or item.type != "snippet":
-            return
-        item.kind = kind
-        # Re-populate so segmented control + body widget match.
-        self._snippet_editor.populate(item)
-        self._rebuild_list()
-        self._refresh_dirty_indicator()
-
-    def _on_behavior_changed(self, item_id: str, behavior: str) -> None:
-        item = self._find_item(item_id)
-        if item is None or item.type != "snippet":
-            return
-        item.behavior = behavior
-        self._refresh_dirty_indicator()
-
     # ------------------------------------------------------------------
     # Save / validation
     # ------------------------------------------------------------------
 
     def _hotkey_index(self) -> dict[str, list[str]]:
-        """Returns hotkey -> list of owner labels (id or pseudo)."""
+        """Returns ``hotkey -> list of owner ids (or LAUNCHER_PSEUDO_ID)``."""
         index: dict[str, list[str]] = {}
         if self._working_config.launcher_hotkey:
-            index.setdefault(self._working_config.launcher_hotkey, []).append(LAUNCHER_PSEUDO_ID)
+            index.setdefault(self._working_config.launcher_hotkey, []).append(
+                LAUNCHER_PSEUDO_ID
+            )
         for it in self._working_config.items:
             if it.hotkey:
                 index.setdefault(it.hotkey, []).append(it.id)
@@ -1671,8 +1568,6 @@ class ManagerWindow(QWidget):
 
     def _detect_conflict(self, focus_owner: str) -> Optional[str]:
         index = self._hotkey_index()
-        # Find any conflict involving the focused owner first.
-        focus_hotkey = None
         if focus_owner == LAUNCHER_PSEUDO_ID:
             focus_hotkey = self._working_config.launcher_hotkey or ""
         else:
@@ -1687,7 +1582,6 @@ class ManagerWindow(QWidget):
                 f"'{other_label}'. Resolve conflict before saving."
             )
 
-        # Otherwise, surface any conflict in the config (rare on this editor).
         for chord, owners in index.items():
             if len(owners) > 1:
                 a = self._label_for_owner(owners[0])
@@ -1699,29 +1593,14 @@ class ManagerWindow(QWidget):
         return None
 
     def _render_chord(self, chord: str) -> str:
-        if not chord:
-            return "—"
-        parts = []
-        for raw in chord.split("+"):
-            tok = raw.strip()
-            if not tok:
-                continue
-            if tok.startswith("<") and tok.endswith(">"):
-                parts.append(tok[1:-1].capitalize())
-            else:
-                parts.append(tok.upper())
-        return "+".join(parts)
+        return "+".join(_humanize_chord(chord)) or "—"
 
     def _current_editor(self) -> Optional[_EditorBase]:
         idx = self._stack.currentIndex()
-        if idx == self.IDX_LAUNCHER:
-            return self._launcher_editor
         if idx == self.IDX_SYSTEM:
             return self._system_editor
         if idx == self.IDX_AI:
             return self._ai_editor
-        if idx == self.IDX_SNIPPET:
-            return self._snippet_editor
         return None
 
     def _refresh_warning_banner(self, editor: _EditorBase) -> None:
@@ -1733,9 +1612,9 @@ class ManagerWindow(QWidget):
         editor.set_warning(msg or "")
 
     def _on_save_clicked(self) -> None:
-        # Hard gate: no duplicate hotkeys.
+        # Hard gate: no duplicate hotkeys may be saved.
         index = self._hotkey_index()
-        conflicts = [(chord, owners) for chord, owners in index.items() if len(owners) > 1]
+        conflicts = [(c, o) for c, o in index.items() if len(o) > 1]
         if conflicts:
             chord, owners = conflicts[0]
             a = self._label_for_owner(owners[0])
@@ -1780,7 +1659,6 @@ class ManagerWindow(QWidget):
             it_b = by_id_b.get(it_a.id)
             if it_b is None:
                 return True
-            # Compare every field on the dataclass.
             for field_name in (
                 "type", "name", "emoji", "hotkey", "enabled", "order", "deletable",
                 "subtype", "prompt", "model", "temperature", "kind", "body", "behavior",
@@ -1798,7 +1676,7 @@ class ManagerWindow(QWidget):
         self.hide()
 
     def closeEvent(self, event):
-        # Don't actually destroy; just hide.
+        # Don't actually destroy; just hide so the next present() reuses state.
         self.closeRequested.emit()
         event.ignore()
         self.hide()
